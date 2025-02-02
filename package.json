@@ -1,0 +1,31 @@
+{
+  "dependencies": {
+    "dotenv": "^16.0.3",
+    "typescript": "^5.0.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.300",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.14",
+    "concurrently": "^7.3.0",
+    "copy-webpack-plugin": "^12.0.2",
+    "nodemon": "^3.1.9",
+    "ts-loader": "^9.5.2",
+    "ts-node": "^10.9.1",
+    "webpack": "^5.97.1",
+    "webpack-cli": "^5.1.4"
+  },
+  "scripts": {
+    "build": "npm run build:server && npm run build:plugin",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:plugin": "webpack --config webpack.config.js --mode production",
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:plugin\"",
+    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec node --loader ts-node/esm src/server/server.ts",
+    "dev:plugin": "webpack --config webpack.config.js --mode development --watch"
+  },
+  "type": "module",
+  "ts-node": {
+    "esm": true
+  }
+}
