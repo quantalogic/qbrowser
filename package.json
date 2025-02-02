@@ -17,12 +17,10 @@
     "webpack-cli": "^5.1.4"
   },
   "scripts": {
-    "build": "npm run build:server && npm run build:plugin",
+    "build": "npm run build:server",
     "build:server": "tsc -p tsconfig.server.json",
-    "build:plugin": "webpack --config webpack.config.js --mode production",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:plugin\"",
-    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec node --loader ts-node/esm src/server/server.ts",
-    "dev:plugin": "webpack --config webpack.config.js --mode development --watch"
+    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec node --loader ts-node/esm src/server/server.ts"
   },
   "type": "module",
   "ts-node": {

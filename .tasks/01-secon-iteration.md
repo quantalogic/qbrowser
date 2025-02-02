@@ -20,4 +20,4 @@ The Extension should be able to:
 
 ## Tasks
 
-Fully complete a document the project
+Fix the chrome extention and improve it.

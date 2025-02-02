@@ -15,6 +15,18 @@ wss.on('connection', (ws, req) => {
                 return;
             }
             console.log('Received valid command:', message);
+            // Log when command is being relayed
+            console.log(`Relaying command to Chrome extension: ${JSON.stringify(message.command)}`);
+            // Add response handling
+            ws.on('response', (responseData) => {
+                try {
+                    const response = JSON.parse(responseData.toString());
+                    console.log(`Received response from Chrome extension: ${JSON.stringify(response)}`);
+                }
+                catch (error) {
+                    console.error('Invalid response format:', error);
+                }
+            });
             // Add additional command processing or routing logic here as needed
         }
         catch (error) {
