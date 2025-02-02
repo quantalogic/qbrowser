@@ -47,3 +47,12 @@
    ```
 
    This will return the complete HTML content of the current page.
+
+6. **Capture a Screenshot:**  
+   To capture a screenshot of the active tab:
+
+   ```bash
+   ./send_command.sh --action screenshot
+   ```
+
+   This will return the screenshot as a base64-encoded image.
