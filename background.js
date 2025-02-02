@@ -393,8 +393,14 @@ async function executeCommand(command) {
     case "screenshot": {
       logInfo("Processing screenshot command...");
       try {
-        // Add a small delay to ensure the tab is ready
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Wait briefly to ensure the tab is ready
+        await delay(100);
+        // Validate that the active tab is using HTTP/HTTPS to prevent capturing non-web pages
+        const tabs = await queryTabs({ active: true, currentWindow: true });
+        if (!tabs[0] || !tabs[0].url || !/^https?:\/\//.test(tabs[0].url)) {
+          throw new Error("Screenshot capture is only allowed on HTTP/HTTPS pages");
+        }
+
         const dataUrl = await captureVisibleTab();
         const response = {
           success: true,
