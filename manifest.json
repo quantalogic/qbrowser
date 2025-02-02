@@ -5,10 +5,11 @@
   "description": "A browser automation extension with WebSocket support",
   "permissions": [
     "activeTab",
+    "tabs",
     "scripting",
     "storage",
     "notifications",
-    "tabs"
+    "tabCapture"
   ],
   "host_permissions": [
     "<all_urls>",

@@ -85,18 +85,49 @@ function updateTab(tabId, updateProperties) {
 
 async function captureVisibleTab() {
   try {
-    const tabs = await queryTabs({ active: true, currentWindow: true });
+    // Get the current active tab
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tabs || tabs.length === 0) {
       throw new Error("No active tab found");
     }
-    
-    logInfo("Attempting to capture screenshot...");
-    const dataUrl = await chrome.tabs.captureVisibleTab(null, {
-      format: 'png'
+    const tab = tabs[0];
+
+    // Ensure the tab is fully loaded
+    if (tab.status !== 'complete') {
+      await new Promise(resolve => {
+        const listener = (tabId, info) => {
+          if (tabId === tab.id && info.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(listener);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(listener);
+      });
+    }
+
+    // Ensure tab is focused
+    await chrome.windows.update(tab.windowId, { focused: true });
+    await chrome.tabs.update(tab.id, { active: true });
+
+    // Wait a brief moment for the tab to be fully focused
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    // Attempt to capture screenshot
+    return await new Promise((resolve, reject) => {
+      chrome.tabs.captureVisibleTab(
+        tab.windowId,
+        { format: 'png' },
+        (dataUrl) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(`Screenshot failed: ${chrome.runtime.lastError.message}`));
+          } else if (!dataUrl) {
+            reject(new Error('Screenshot capture returned empty result'));
+          } else {
+            resolve(dataUrl);
+          }
+        }
+      );
     });
-    
-    logInfo("Screenshot captured successfully");
-    return dataUrl;
   } catch (error) {
     logError(`Screenshot capture failed: ${error.message}`);
     throw error;
@@ -362,6 +393,8 @@ async function executeCommand(command) {
     case "screenshot": {
       logInfo("Processing screenshot command...");
       try {
+        // Add a small delay to ensure the tab is ready
+        await new Promise(resolve => setTimeout(resolve, 100));
         const dataUrl = await captureVisibleTab();
         const response = {
           success: true,
@@ -370,10 +403,18 @@ async function executeCommand(command) {
           screenshot: dataUrl,
           timestamp: new Date().toISOString(),
         };
-        logInfo("Sending screenshot response...");
+        logInfo("Screenshot captured successfully");
         sendResponse(response);
       } catch (error) {
-        throw new Error(`Screenshot failed: ${error.message}`);
+        const errorResponse = {
+          success: false,
+          requestId: command.requestId,
+          action: "screenshot",
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        };
+        sendResponse(errorResponse);
+        throw error;
       }
       break;
     }
