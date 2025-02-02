@@ -1,5 +1,19 @@
 // src/server/server.js
 
+/*
+  A stateful WebSocket server that:
+    – Relays automation commands from clients to a registered browser extension.
+    – Stores automation responses keyed by requestId (with a TTL) so that clients
+      may later query for the result even if their connection closes.
+
+Message types:
+  • "REGISTER_EXTENSION": Used by the extension to register. (API key verified.)
+  • "automation-command": Sent by a client (must include a unique requestId).
+  • "automation-response": Sent by the extension in reply.
+       The server forwards it to the originating client and stores it.
+  • "query-response": Sent by a client to retrieve a stored result.
+*/
+
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
@@ -7,24 +21,21 @@ import { dirname } from "path";
 
 config();
 
-// Convert __filename and __dirname for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const PORT = 8765;
 const API_KEY = process.env.API_KEY || "DEFAULT_SECRET";
 
-// Logging utility
+// Logger utility.
 const logger = {
-  info: (context, message) => {
-    console.info(`[${new Date().toISOString()}][${context}]`, message);
-  },
-  error: (context, message) => {
-    console.error(`[${new Date().toISOString()}][${context}]`, message);
-  },
+  info: (context, message) =>
+    console.info(`[${new Date().toISOString()}][${context}]`, message),
+  error: (context, message) =>
+    console.error(`[${new Date().toISOString()}][${context}]`, message),
 };
 
-// Connection state constants (added DISCONNECTING)
+// Connection state constants.
 const ConnectionState = {
   DISCONNECTED: "disconnected",
   CONNECTING: "connecting",
@@ -38,19 +49,40 @@ let extensionStatus = {
   lastUpdated: Date.now(),
 };
 
-let extensionConnection = null; // Object containing ws, lastHeartbeat, status
-const clientConnections = new Map();
+let extensionConnection = null; // The registered extension's WebSocket.
+const clientConnections = new Map(); // Maps requestId => client WebSocket.
 
-// Heartbeat interval settings (in milliseconds)
-const HEARTBEAT_INTERVAL = 30000;
-const HEARTBEAT_TIMEOUT = 35000;
+// In-memory store for automation responses (keyed by requestId).
+const storedResults = new Map();
+// TTL (in milliseconds) for stored responses.
+const RESULT_TTL = 5 * 60 * 1000; // 5 minutes
 
-// Periodically check extension connection's heartbeat
+const HEARTBEAT_INTERVAL = 30000; // 30 seconds.
+const HEARTBEAT_TIMEOUT = 35000; // 35 seconds.
+
+// Clean up expired stored results.
+setInterval(() => {
+  const now = Date.now();
+  for (const [requestId, { timestamp }] of storedResults.entries()) {
+    if (now - timestamp > RESULT_TTL) {
+      storedResults.delete(requestId);
+      logger.info(
+        "Cleanup",
+        `Deleted stored result for requestId: ${requestId}`
+      );
+    }
+  }
+}, 60000);
+
+// Check extension heartbeat.
 setInterval(() => {
   if (extensionConnection) {
     const now = Date.now();
     if (now - extensionConnection.lastHeartbeat > HEARTBEAT_TIMEOUT) {
-      logger.error("Extension", "Extension heartbeat timeout - closing connection");
+      logger.error(
+        "Extension",
+        "Heartbeat timeout, closing extension connection."
+      );
       extensionConnection.ws.close();
       extensionConnection = null;
       updateExtensionStatus(ConnectionState.DISCONNECTED);
@@ -58,28 +90,31 @@ setInterval(() => {
   }
 }, HEARTBEAT_INTERVAL);
 
-// Helper to send error responses
+/**
+ * Sends an error response to a client.
+ */
 function sendErrorResponse(ws, error, requestId) {
-  const errorResponse = {
+  const errMsg = {
     success: false,
     error,
     requestId,
     timestamp: new Date().toISOString(),
   };
-
   if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(errorResponse));
+    ws.send(JSON.stringify(errMsg));
   }
 }
 
-// Update extension status and notify all clients about the change
-function updateExtensionStatus(status, error) {
+/**
+ * Updates the extension status and notifies connected clients.
+ */
+function updateExtensionStatus(status, errorInfo) {
   extensionStatus = {
     state: status,
-    lastError: error,
+    lastError: errorInfo,
     lastUpdated: Date.now(),
   };
-
+  // Optionally notify clients.
   for (const clientWs of clientConnections.values()) {
     if (clientWs.readyState === WebSocket.OPEN) {
       clientWs.send(
@@ -93,21 +128,126 @@ function updateExtensionStatus(status, error) {
   }
 }
 
-// Create the WebSocket server
+/**
+ * Handles incoming messages from any connection.
+ */
+function handleMessage(ws, messageStr) {
+  let message;
+  try {
+    message = JSON.parse(messageStr);
+  } catch (err) {
+    logger.error("MessageHandler", "Invalid JSON received");
+    ws.send(
+      JSON.stringify({
+        success: false,
+        error: "Invalid JSON format",
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return;
+  }
+
+  // Process extension registration.
+  if (message.type === "REGISTER_EXTENSION") {
+    if (message.apiKey !== API_KEY) {
+      updateExtensionStatus(ConnectionState.ERROR, "Invalid API key");
+      ws.close();
+      return;
+    }
+    if (extensionConnection) {
+      updateExtensionStatus(ConnectionState.DISCONNECTING);
+      extensionConnection.ws.close();
+    }
+    extensionConnection = { ws, lastHeartbeat: Date.now() };
+    updateExtensionStatus(ConnectionState.CONNECTED);
+    ws.send(
+      JSON.stringify({
+        type: "registration",
+        success: true,
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return;
+  }
+
+  // For non-registration messages, verify API key.
+  if (message.apiKey !== API_KEY) {
+    sendErrorResponse(ws, "Unauthorized access attempt", message.requestId);
+    ws.close();
+    return;
+  }
+
+  // Process an automation-response from the extension.
+  if (message.type === "automation-response") {
+    if (message.payload && message.payload.requestId) {
+      storedResults.set(message.payload.requestId, {
+        result: message,
+        timestamp: Date.now(),
+      });
+      const clientWs = clientConnections.get(message.payload.requestId);
+      if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify(message));
+        clientConnections.delete(message.payload.requestId);
+      }
+    }
+    return;
+  }
+
+  // Process a query for a stored result.
+  if (message.type === "query-response") {
+    const resultEntry = storedResults.get(message.requestId);
+    if (resultEntry) {
+      ws.send(JSON.stringify(resultEntry.result));
+    } else {
+      ws.send(
+        JSON.stringify({
+          success: false,
+          error: "No stored result found for this requestId",
+          requestId: message.requestId,
+          timestamp: new Date().toISOString(),
+        })
+      );
+    }
+    return;
+  }
+
+  // Process an automation-command from a client.
+  if (message.type === "automation-command") {
+    if (message.requestId) {
+      clientConnections.set(message.requestId, ws);
+    }
+    if (
+      !extensionConnection ||
+      extensionConnection.ws.readyState !== WebSocket.OPEN
+    ) {
+      const errMsg = `Extension not connected (status: ${extensionStatus.state})`;
+      logger.error("Relay", errMsg);
+      sendErrorResponse(ws, errMsg, message.requestId);
+      return;
+    }
+    logger.info("Relay", { command: message });
+    extensionConnection.ws.send(JSON.stringify(message));
+    return;
+  }
+
+  // Unknown message type.
+  ws.send(
+    JSON.stringify({
+      success: false,
+      error: "Unknown message type",
+      timestamp: new Date().toISOString(),
+    })
+  );
+}
+
 const wss = new WebSocketServer({ port: PORT });
-logger.info("Server", `WebSocket server is listening on port ${PORT}`);
+logger.info("Server", `WebSocket server listening on port ${PORT}`);
 
 wss.on("connection", (ws, req) => {
-  const clientId = Math.random().toString(36).substring(7);
-  const clientIp = req.socket.remoteAddress;
-  logger.info("Connection", {
-    clientId,
-    ip: clientIp,
-    headers: req.headers,
-    timestamp: new Date().toISOString(),
-  });
+  const clientId = Math.random().toString(36).substring(2, 7);
+  const ip = req.socket.remoteAddress;
+  logger.info("Connection", { clientId, ip, headers: req.headers });
 
-  // Setup ping/pong handling
   ws.on("ping", () => ws.pong());
   ws.on("pong", () => {
     if (extensionConnection && extensionConnection.ws === ws) {
@@ -115,122 +255,16 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("message", async (data) => {
-    try {
-      const message = JSON.parse(data.toString());
-      logger.info("Received", {
-        clientId,
-        message,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Handle extension registration message
-      if (message.type === "REGISTER_EXTENSION") {
-        if (message.apiKey !== API_KEY) {
-          updateExtensionStatus(ConnectionState.ERROR, "Invalid API key");
-          ws.close();
-          return;
-        }
-
-        // If an extension connection already exists, close it properly
-        if (extensionConnection) {
-          updateExtensionStatus(ConnectionState.DISCONNECTING);
-          extensionConnection.ws.close();
-        }
-
-        extensionConnection = {
-          ws,
-          lastHeartbeat: Date.now(),
-          status: {
-            state: ConnectionState.CONNECTED,
-            lastUpdated: Date.now(),
-          },
-        };
-
-        updateExtensionStatus(ConnectionState.CONNECTED);
-
-        // Start a heartbeat interval for this connection
-        const heartbeat = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.ping();
-          } else {
-            clearInterval(heartbeat);
-          }
-        }, HEARTBEAT_INTERVAL);
-
-        return;
-      }
-
-      // Validate API Key for client messages
-      if (message.apiKey !== API_KEY) {
-        sendErrorResponse(ws, "Unauthorized access attempt");
-        ws.close();
-        return;
-      }
-
-      // Ensure the extension connection is active and open
-      if (
-        !extensionConnection ||
-        extensionConnection.ws.readyState !== WebSocket.OPEN
-      ) {
-        const errorMsg = `Chrome extension not connected (Status: ${extensionStatus.state})`;
-        logger.error("Relay", { clientId, error: errorMsg, extensionStatus });
-        sendErrorResponse(ws, errorMsg, message.requestId);
-        return;
-      }
-
-      // Map client connection by requestId for later response routing
-      clientConnections.set(message.requestId, ws);
-
-      // Relay the command message to the extension
-      logger.info("Relay", {
-        clientId,
-        status: "SENDING_TO_EXTENSION",
-        command: message,
-      });
-      extensionConnection.ws.send(JSON.stringify(message));
-    } catch (err) {
-      logger.error("MessageError", {
-        clientId,
-        error: err && err.message ? err.message : "Unknown error",
-        data: data.toString(),
-        stack: err && err.stack ? err.stack : "No stack trace",
-      });
-      ws.send(
-        JSON.stringify({
-          success: false,
-          error: "Invalid message format",
-          timestamp: new Date().toISOString(),
-        })
-      );
-    }
+  ws.on("message", (data) => {
+    const messageStr = data.toString();
+    logger.info("Received", { clientId, message: messageStr });
+    handleMessage(ws, messageStr);
   });
-
-  // If this connection is the extension, handle its responses
-  if (extensionConnection && ws === extensionConnection.ws) {
-    ws.on("message", (data) => {
-      try {
-        const response = JSON.parse(data.toString());
-        const clientWs = clientConnections.get(response.requestId);
-        if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(data);
-          clientConnections.delete(response.requestId);
-        }
-      } catch (err) {
-        logger.error("ResponseError", {
-          error: err && err.message ? err.message : "Unknown error",
-          data: data.toString(),
-        });
-      }
-    });
-  }
 
   ws.on("close", () => {
     if (extensionConnection && extensionConnection.ws === ws) {
       extensionConnection = null;
       updateExtensionStatus(ConnectionState.DISCONNECTED);
-
-      // Notify all connected clients about the extension disconnecting
       for (const clientWs of clientConnections.values()) {
         if (clientWs.readyState === WebSocket.OPEN) {
           clientWs.send(
@@ -243,28 +277,22 @@ wss.on("connection", (ws, req) => {
         }
       }
     }
-    logger.info("Disconnection", {
-      clientId,
-      ip: clientIp,
-      timestamp: new Date().toISOString(),
-    });
+    logger.info("Disconnection", { clientId, ip });
   });
 
   ws.on("error", (err) => {
+    logger.error("WebSocketError", { clientId, error: err.message });
     if (extensionConnection && extensionConnection.ws === ws) {
       updateExtensionStatus(ConnectionState.ERROR, err.message);
     }
-    logger.error("WebSocketError", {
-      clientId,
-      error: err.message || "Unknown error",
-      stack: err.stack || "No stack trace",
-    });
   });
 });
 
-// Health check: periodically send a ping to the extension connection if active
 setInterval(() => {
-  if (extensionConnection && extensionConnection.ws.readyState === WebSocket.OPEN) {
+  if (
+    extensionConnection &&
+    extensionConnection.ws.readyState === WebSocket.OPEN
+  ) {
     try {
       extensionConnection.ws.ping();
     } catch (err) {

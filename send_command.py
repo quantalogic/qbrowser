@@ -5,127 +5,216 @@
 # dependencies = [
 #     "argparse",
 #     "websockets",
-#     "asyncio"
+#     "asyncio",
+#     "uuid"
 # ]
 # ///
+
+"""
+send_command.py
+
+A command-line client to send browser automation commands via WebSocket
+and query for the answer by request-id if needed.
+
+Usage as an automation command:
+    ./send_command.py --action screenshot [--xpath XPATH] [--text TEXT] [--url URL]
+
+Usage as a query (retrieve a stored answer):
+    ./send_command.py --query <requestId>
+
+Make sure the API_KEY environment variable is set.
+"""
+
 import argparse
+import asyncio
+import base64
 import json
 import os
 import sys
-import base64
 from datetime import datetime, timezone
+import uuid
 import websockets
-import asyncio
 
-def save_screenshot(base64_data: str) -> str:
-    """Save base64 screenshot data to a PNG file."""
-    # Remove data URL prefix if present
-    if isinstance(base64_data, dict) and 'data' in base64_data:
-        base64_data = base64_data['data']
-    if isinstance(base64_data, str):
-        if base64_data.startswith('data:image/png;base64,'):
-            base64_data = base64_data.split(',')[1]
+def generate_request_id() -> str:
+    # Generate a unique request ID using uuid4.
+    return str(uuid.uuid4())
+
+def save_screenshot(data: str) -> str:
+    """
+    Decode a base64-encoded screenshot (with a data URI prefix)
+    and save it to a PNG file.
+    Returns the filename.
+    """
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if isinstance(data, str) and data.startswith("data:image/png;base64,"):
+        data = data.split(",", 1)[1]
     else:
         raise ValueError("Invalid screenshot data format")
-    
     filename = f"screenshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    with open(filename, 'wb') as f:
-        f.write(base64.b64decode(base64_data))
+    with open(filename, "wb") as f:
+        f.write(base64.b64decode(data))
     return filename
 
 def handle_response(response: dict) -> None:
-    """Handle and display the command response."""
+    """
+    Unwrap and display the final response.
+    If a screenshot is provided, save it.
+    """
+    if "payload" in response:
+        response = response["payload"]
     print("\nCommand Response:")
-    
     print(f"Status: {response.get('success', False)}")
     print(f"Action: {response.get('action', 'unknown')}")
     print(f"Timestamp: {response.get('timestamp')}")
-    
-    if error := response.get('error'):
-        print(f"\nError:\n{error}")
+    if error := response.get("error"):
+        print("\nError:")
+        print(error)
         sys.exit(1)
-        
-    if html := response.get('html'):
-        print("\nHTML Content:")
-        print('\n'.join(html.split('\n')[:50]))
-        print("... (truncated)")
+    if html := response.get("html"):
+        snippet = "\n".join(html.splitlines()[:50])
+        print("\nHTML Content (first 50 lines):")
+        print(snippet)
         filename = f"page-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
-        with open(filename, 'w') as f:
+        with open(filename, "w") as f:
             f.write(html)
         print(f"Full HTML saved to {filename}")
-        
-    # Updated screenshot handling
-    if screenshot := response.get('screenshot'):
+    if screenshot := response.get("screenshot"):
         try:
             filename = save_screenshot(screenshot)
             print(f"\nScreenshot saved as: {filename}")
         except Exception as e:
             print(f"\nError saving screenshot: {e}")
-        
-    if message := response.get('message'):
-        print(f"\nMessage:\n{message}")
+    if message := response.get("message"):
+        print("\nMessage:")
+        print(message)
 
-async def send_command(websocket, command: dict) -> None:
-    """Send command to websocket server and handle response."""
-    await websocket.send(json.dumps(command))
-    response = await websocket.recv()
-    try:
-        handle_response(json.loads(response))
-    except json.JSONDecodeError:
-        print("Error: Invalid JSON response received:")
-        print(response)
-        sys.exit(1)
+async def send_message(ws, message: dict) -> None:
+    """Send a JSON message over the WebSocket."""
+    await ws.send(json.dumps(message))
 
-async def run(command: dict):
+async def wait_for_automation_response(ws) -> dict:
+    """
+    Loop reading messages on the connection until one has type "automation-response".
+    Other messages (such as extension_status) are logged and ignored.
+    """
+    while True:
+        raw = await ws.recv()
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            print("Error: Received invalid JSON", raw)
+            continue
+        msg_type = msg.get("type")
+        if msg_type == "automation-response":
+            print("Received automation-response with requestId:",
+                  msg.get("payload", {}).get("requestId"))
+            return msg
+        # If no explicit type but the payload looks like an automation response, use it.
+        if msg_type is None and "payload" in msg and msg.get("payload", {}).get("action"):
+            print("Received automation-like payload.")
+            return msg
+        # Log ignored messages.
+        print("Ignoring message of type:", msg.get("type"))
+
+async def automation_command(command: dict, timeout: int = 120) -> None:
+    """
+    Open a WebSocket connection, send the automation command, and await an automation-response.
+    If connection closes too early, automatically fall back to a query.
+    """
+    api_key = command["apiKey"]
+    request_id = command["requestId"]
     try:
-        async with websockets.connect('ws://localhost:8765') as websocket:
-            await asyncio.wait_for(send_command(websocket, command), timeout=30)
+        async with websockets.connect("ws://localhost:8765") as ws:
+            await send_message(ws, command)
+            response = await asyncio.wait_for(wait_for_automation_response(ws), timeout=timeout)
+            handle_response(response)
+    except (websockets.ConnectionClosed, asyncio.IncompleteReadError):
+        print("Connection closed before a response was received. Querying stored result...")
+        await query_response({
+            "type": "query-response",
+            "apiKey": api_key,
+            "requestId": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        })
     except asyncio.TimeoutError:
-        print("Error: Connection timed out", file=sys.stderr)
+        print(f"Error: Timed out after {timeout} seconds waiting for a response.", file=sys.stderr)
         sys.exit(1)
     except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:
-        print(f"Error: Failed to connect to WebSocket server: {e}", file=sys.stderr)
+        print(f"Error: Could not connect to the server: {e}", file=sys.stderr)
+        sys.exit(1)
+
+async def query_response(query: dict, timeout: int = 30) -> None:
+    """
+    Open a WebSocket connection, send a query message (type "query-response"),
+    and wait for the stored result.
+    """
+    try:
+        async with websockets.connect("ws://localhost:8765") as ws:
+            await send_message(ws, query)
+            response = await asyncio.wait_for(wait_for_automation_response(ws), timeout=timeout)
+            handle_response(response)
+    except asyncio.TimeoutError:
+        print(f"Error: Timed out after {timeout} seconds waiting for query response.", file=sys.stderr)
+        sys.exit(1)
+    except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:
+        print(f"Error: Could not connect to the server: {e}", file=sys.stderr)
         sys.exit(1)
 
 def main():
-    parser = argparse.ArgumentParser(description='Send commands to browser automation service')
-    parser.add_argument('--action', required=True, help='Action to perform')
-    parser.add_argument('--xpath', help='XPath selector')
-    parser.add_argument('--text', help='Text to type')
-    parser.add_argument('--x', type=float, help='X coordinate')
-    parser.add_argument('--y', type=float, help='Y coordinate')
-    parser.add_argument('--url', help='URL to navigate to')
-    parser.add_argument('--requestId', help='Request ID')
-    parser.add_argument('--timestamp', help='Timestamp')
+    parser = argparse.ArgumentParser(
+        description="Send browser automation commands via WebSocket."
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--action", help="Command action (e.g. screenshot, click, etc.)")
+    group.add_argument("--query", help="Query a response using a request-id")
+    
+    parser.add_argument("--xpath", help="XPath selector for an element")
+    parser.add_argument("--text", help="Text to type into an element")
+    parser.add_argument("--x", type=float, help="X coordinate for a click")
+    parser.add_argument("--y", type=float, help="Y coordinate for a click")
+    parser.add_argument("--url", help="URL to navigate to")
+    parser.add_argument("--timestamp", help="Optional ISO timestamp")
     
     args = parser.parse_args()
-    
-    # Get API key from environment
-    api_key = os.environ.get('API_KEY')
+    api_key = os.environ.get("API_KEY")
     if not api_key:
-        print("Error: Please set the API_KEY environment variable.", file=sys.stderr)
+        print("Error: API_KEY environment variable must be set.", file=sys.stderr)
         sys.exit(1)
     
-    # Build command
-    command = {
-        'action': args.action,
-        'apiKey': api_key,
-        'requestId': args.requestId or f"req-{int(datetime.now().timestamp())}",
-        'timestamp': args.timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-    }
-    
-    # Add optional parameters if provided
-    if args.xpath: command['xpath'] = args.xpath
-    if args.text: command['text'] = args.text
-    if args.x is not None: command['x'] = args.x
-    if args.y is not None: command['y'] = args.y
-    if args.url: command['url'] = args.url
-    
-    print("Sending command:")
-    print(json.dumps(command))
-    
-    # Pass command to run()
-    asyncio.run(run(command))
+    if args.query:
+        query_msg = {
+            "type": "query-response",
+            "apiKey": api_key,
+            "requestId": args.query,
+            "timestamp": args.timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        print("Sending query for request-id:", args.query)
+        asyncio.run(query_response(query_msg))
+    else:
+        request_id = generate_request_id()
+        command = {
+            "type": "automation-command",
+            "action": args.action,
+            "apiKey": api_key,
+            "requestId": request_id,
+            "timestamp": args.timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        }
+        if args.xpath:
+            command["xpath"] = args.xpath
+        if args.text:
+            command["text"] = args.text
+        if args.x is not None:
+            command["x"] = args.x
+        if args.y is not None:
+            command["y"] = args.y
+        if args.url:
+            command["url"] = args.url
 
-if __name__ == '__main__':
+        print("Sending automation command:")
+        print(json.dumps(command, indent=2))
+        print(f"Generated Request ID: {request_id}")
+        asyncio.run(automation_command(command))
+
+if __name__ == "__main__":
     main()
