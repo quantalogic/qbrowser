@@ -1,28 +1,28 @@
 document.addEventListener('DOMContentLoaded', () => {
   const logArea = document.getElementById('logArea');
   const connectionStatus = document.getElementById('connectionStatus');
-  const clearLogsBtn = document.getElementById('clearLogs');
+  const clearLogsButton = document.getElementById('clearLogs');
 
-  // Listen for log messages from background.js
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'LOG') {
-      appendLog(message.payload);
-    } else if (message.type === 'CONNECTION_STATUS') {
-      updateConnectionStatus(message.payload);
-    }
-  });
-
-  clearLogsBtn.addEventListener('click', () => {
-    logArea.textContent = '';
-  });
-
-  function appendLog(text) {
-    const timeStamp = new Date().toLocaleTimeString();
-    logArea.textContent += `[${timeStamp}] ${text}\n`;
+  function appendLog(message, level = 'info') {
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${level === 'command' ? 'command-received' : ''} ${level === 'error' ? 'error-log' : ''}`;
+    entry.textContent = `${new Date().toLocaleTimeString()} - ${message}`;
+    logArea.appendChild(entry);
     logArea.scrollTop = logArea.scrollHeight;
   }
 
-  function updateConnectionStatus(status) {
-    connectionStatus.textContent = status;
-  }
+  chrome.runtime.onMessage.addListener((message) => {
+    switch (message.type) {
+      case 'LOG':
+        appendLog(message.payload, message.level);
+        break;
+      case 'CONNECTION_STATUS':
+        connectionStatus.textContent = message.payload;
+        break;
+    }
+  });
+
+  clearLogsButton.addEventListener('click', () => {
+    logArea.innerHTML = '';
+  });
 });

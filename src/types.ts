@@ -1,23 +1,30 @@
+// src/types.ts
 export type CommandAction =
   | 'click'
   | 'type'
   | 'navigate'
   | 'screenshot'
   | 'ocr'
-  | 'clickAtCoordinates';
+  | 'clickAtCoordinates'
+  | 'getHtml'
+  | 'executeScript';
 
 export interface Command {
   action: CommandAction;
-  xpath?: string;
-  text?: string;
   requestId?: string;
   apiKey?: string;
   timestamp?: string;
-  // For navigate
+  // For navigate action
   url?: string;
-  // For clickAtCoordinates
+  // For click and type commands
+  xpath?: string;
+  selector?: string;
+  text?: string;
+  // For clickAtCoordinates command
   x?: number;
   y?: number;
+  // For executeScript command
+  script?: string;
 }
 
 export interface SuccessResponse {
@@ -27,6 +34,9 @@ export interface SuccessResponse {
   timestamp: string;
   // Optional screenshot data (for screenshot actions)
   screenshot?: string;
+  action?: string;
+  result?: any;
+  message?: string;
 }
 
 export interface ChromeMessage<T = any> {

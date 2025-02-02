@@ -13,10 +13,17 @@
 #   export API_KEY="YOUR_SECRET_KEY"
 #
 
+# Helper function to print usage and exit
 usage() {
   echo "Usage: $0 --action <action> [--xpath <xpath>] [--text <text>] [--x <x>] [--y <y>] [--url <url>] [--requestId <id>] [--timestamp <timestamp>]" 1>&2
   exit 1
 }
+
+# Verify that websocat is installed
+if ! command -v websocat >/dev/null 2>&1; then
+  echo "Error: websocat command not found. Please install websocat and try again." 1>&2
+  exit 1
+fi
 
 # Initialize variables
 action=""
@@ -40,16 +47,16 @@ while [[ "$#" -gt 0 ]]; do
     --requestId) requestId="$2"; shift ;;
     --timestamp) timestamp="$2"; shift ;;
     *)
-      echo "Unknown parameter passed: $1"
+      echo "Unknown parameter passed: $1" 1>&2
       usage
       ;;
   esac
   shift
 done
 
-# Require an action parameter
+# Require the --action parameter
 if [ -z "${action}" ]; then
-  echo "Error: --action is required."
+  echo "Error: --action is required." 1>&2
   usage
 fi
 
@@ -64,35 +71,34 @@ fi
 
 # Check if API_KEY is set in the environment
 if [ -z "${API_KEY}" ]; then
-  echo "Error: Please set the API_KEY environment variable."
+  echo "Error: Please set the API_KEY environment variable." 1>&2
   exit 1
 fi
 
-# Build the JSON payload
-json="{\"action\": \"${action}\""
-if [ -n "${xpath}" ]; then
-  json+=", \"xpath\": \"${xpath}\""
-fi
-if [ -n "${text}" ]; then
-  json+=", \"text\": \"${text}\""
-fi
-if [ -n "${x}" ]; then
-  json+=", \"x\": ${x}"
-fi
-if [ -n "${y}" ]; then
-  json+=", \"y\": ${y}"
-fi
-if [ -n "${url}" ]; then
-  json+=", \"url\": \"${url}\""
-fi
-json+=", \"requestId\": \"${requestId}\""
-json+=", \"apiKey\": \"${API_KEY}\""
-json+=", \"timestamp\": \"${timestamp}\""
-json+="}"
+# Build the JSON payload using printf for safety with quotes.
+json=$(printf '{
+  "action": "%s",
+  "xpath": "%s",
+  "text": "%s",
+  "x": %s,
+  "y": %s,
+  "url": "%s",
+  "requestId": "%s",
+  "apiKey": "%s",
+  "timestamp": "%s"
+}' "${action}" "${xpath}" "${text}" "${x:-null}" "${y:-null}" "${url}" "${requestId}" "${API_KEY}" "${timestamp}")
 
-# Output the JSON that will be sent so you can verify it
+# Optionally remove empty or null keys using jq if available.
+if command -v jq >/dev/null 2>&1; then
+  json=$(echo "$json" | jq 'del(.xpath|select(.=="")) | del(.text|select(.=="")) | del(.url|select(.=="")) | del(.x|select(.==null)) | del(.y|select(.==null))')
+fi
+
+# Remove newline characters to ensure compact JSON output.
+oneline_json=$(echo "$json" | tr -d '\n')
+
 echo "Sending command:"
-echo "$json"
+echo "$oneline_json"
 
-# Send the JSON payload to the WebSocket server using websocat
-echo "$json" | websocat ws://localhost:8765
+# Send the JSON payload to the WebSocket server using websocat.
+# Use printf without a trailing newline and -1 for single-shot transmission.
+printf "%s" "$oneline_json" | websocat -1 ws://localhost:8765

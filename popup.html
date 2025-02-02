@@ -1,12 +1,15 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QBrowser Extension</title>
   <style>
     body {
       width: 300px;
       font-family: Arial, sans-serif;
       padding: 10px;
+      margin: 0;
     }
     #status {
       margin-bottom: 10px;
@@ -16,6 +19,7 @@
       width: 100%;
       padding: 5px;
       margin-bottom: 10px;
+      box-sizing: border-box;
     }
     #logArea {
       width: 100%;
@@ -26,6 +30,19 @@
       font-size: 12px;
       padding: 5px;
       margin-bottom: 10px;
+      box-sizing: border-box;
+      font-family: monospace;
+    }
+    .log-entry {
+      padding: 2px 0;
+      border-bottom: 1px solid #eee;
+    }
+    .command-received {
+      color: #2196F3;
+      font-weight: bold;
+    }
+    .error-log {
+      color: #f44336;
     }
     button {
       padding: 5px 10px;
@@ -41,11 +58,18 @@
   </style>
 </head>
 <body>
-  <div id="status">Status: <span id="connectionStatus">Unknown</span></div>
-  <input type="text" id="searchBox" placeholder="Search tabs...">
-  <div id="results"></div>
+  <div id="status" aria-live="polite">
+    Status: <span id="connectionStatus">Unknown</span>
+  </div>
+  <input
+    type="text"
+    id="searchBox"
+    placeholder="Search tabs..."
+    aria-label="Search tabs"
+  />
+  <div id="results" role="list"></div>
   <h4>Event Log</h4>
-  <div id="logArea"></div>
+  <div id="logArea" aria-live="polite"></div>
   <button id="clearLogs">Clear Logs</button>
 
   <script src="popup.js"></script>

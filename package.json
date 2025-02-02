@@ -20,7 +20,7 @@
     "build": "npm run build:server",
     "build:server": "tsc -p tsconfig.server.json",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:plugin\"",
-    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec node --loader ts-node/esm src/server/server.ts"
+    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec 'node --experimental-specifier-resolution=node --loader ts-node/esm' src/server/server.ts"
   },
   "type": "module",
   "ts-node": {
