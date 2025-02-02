@@ -1,29 +1,27 @@
 {
+  "name": "your-project-name",
+  "version": "1.0.0",
+  "description": "A WebSocket server project for a Chrome extension, implemented in plain JavaScript",
+  "main": "src/server/server.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:plugin\"",
+    "dev:server": "nodemon --exec \"node\" src/server/server.js",
+    "dev:plugin": "echo \"No plugin available\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
+    "again": "^0.0.1",
     "dotenv": "^16.0.3",
-    "typescript": "^5.0.4",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@types/chrome": "^0.0.300",
-    "@types/node": "^20.11.0",
-    "@types/ws": "^8.5.14",
     "concurrently": "^7.3.0",
-    "copy-webpack-plugin": "^12.0.2",
-    "nodemon": "^3.1.9",
-    "ts-loader": "^9.5.2",
-    "ts-node": "^10.9.1",
-    "webpack": "^5.97.1",
-    "webpack-cli": "^5.1.4"
-  },
-  "scripts": {
-    "build": "npm run build:server",
-    "build:server": "tsc -p tsconfig.server.json",
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:plugin\"",
-    "dev:server": "nodemon --watch 'src/server/**/*.ts' --exec 'node --experimental-specifier-resolution=node --loader ts-node/esm' src/server/server.ts"
+    "nodemon": "^3.0.0"
   },
   "type": "module",
-  "ts-node": {
-    "esm": true
+  "nodemonConfig": {
+    "exec": "node"
   }
 }

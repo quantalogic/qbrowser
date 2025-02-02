@@ -59,21 +59,34 @@ function typeText(element, text) {
 }
 
 /**
- * Execute arbitrary JavaScript code.
- * NOTE: Using the Function constructor here provides limited scope isolation
- * but does not fully secure against malicious code. Consider sandboxing if needed.
+ * Execute arbitrary JavaScript code with timeout.
  */
 function executeJavascript(script) {
-  try {
-    const func = new Function(script);
-    return func();
-  } catch (error) {
-    throw new Error("Script execution failed: " + error.message);
-  }
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error("Script execution timed out after 5000ms"));
+    }, 5000);
+
+    try {
+      const func = new Function(script);
+      const result = func();
+      clearTimeout(timeoutId);
+      resolve(result);
+    } catch (error) {
+      clearTimeout(timeoutId);
+      reject(new Error("Script execution failed: " + error.message));
+    }
+  });
 }
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // Add ping handler
+// Add cleanup handler
+const cleanup = () => {
+  // Cleanup any ongoing operations
+  chrome.runtime.onMessage.removeListener(messageListener);
+};
+
+// Store listener reference for cleanup
+const messageListener = async (request, sender, sendResponse) => {
   if (request.type === "PING") {
     sendResponse({ status: "OK" });
     return;
@@ -85,71 +98,86 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   const command = request.payload;
   
-  // Wrap execution in async IIFE with error boundary
-  (async () => {
-    try {
-      let response = { success: true };
-      
-      // Add context verification
-      if (!document.documentElement) {
-        throw new Error("Document not ready");
-      }
+  // Add execution timeout
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("Command execution timed out")), 10000);
+  });
 
-      switch (command.action) {
-        case "click": {
-          let element = command.xpath
-            ? getElementByXPath(command.xpath)
-            : document.querySelector(command.selector);
-          if (element) {
-            simulateClick(element);
-          } else {
-            throw new Error("Element not found for click");
-          }
-          break;
-        }
-        case "clickAtCoordinates": {
-          if (command.x !== undefined && command.y !== undefined) {
-            clickAtCoordinates(command.x, command.y);
-          } else {
-            throw new Error("Coordinates not provided for clickAtCoordinates");
-          }
-          break;
-        }
-        case "type": {
-          let element = command.xpath
-            ? getElementByXPath(command.xpath)
-            : document.querySelector(command.selector);
-          if (element && command.text !== undefined) {
-            typeText(element, command.text);
-          } else {
-            throw new Error("Element not found or text missing for type command");
-          }
-          break;
-        }
-        case "getHtml": {
-          response = { html: document.documentElement.outerHTML };
-          break;
-        }
-        case "executeScript": {
-          if (!command.script) {
-            throw new Error("No script provided for execution");
-          }
-          const result = executeJavascript(command.script);
-          response = { result };
-          break;
-        }
-        default:
-          throw new Error("Unknown command: " + command.action);
+  try {
+    const result = await Promise.race([
+      processCommand(command),
+      timeoutPromise
+    ]);
+    sendResponse(result);
+  } catch (error) {
+    sendResponse(logError(error, command.action));
+  }
+  
+  return true;
+};
+
+chrome.runtime.onMessage.addListener(messageListener);
+
+// Cleanup on unload
+window.addEventListener('unload', cleanup);
+
+async function processCommand(command) {
+  let response = { success: true };
+  
+  // Add context verification
+  if (!document.documentElement) {
+    throw new Error("Document not ready");
+  }
+
+  switch (command.action) {
+    case "click": {
+      let element = command.xpath
+        ? getElementByXPath(command.xpath)
+        : document.querySelector(command.selector);
+      if (element) {
+        simulateClick(element);
+      } else {
+        throw new Error("Element not found for click");
       }
-      
-      sendResponse(response);
-    } catch (error) {
-      sendResponse(logError(error, command.action));
+      break;
     }
-  })();
-
-  return true; // Keep channel open for async response
-});
+    case "clickAtCoordinates": {
+      if (command.x !== undefined && command.y !== undefined) {
+        clickAtCoordinates(command.x, command.y);
+      } else {
+        throw new Error("Coordinates not provided for clickAtCoordinates");
+      }
+      break;
+    }
+    case "type": {
+      let element = command.xpath
+        ? getElementByXPath(command.xpath)
+        : document.querySelector(command.selector);
+      if (element && command.text !== undefined) {
+        typeText(element, command.text);
+      } else {
+        throw new Error("Element not found or text missing for type command");
+      }
+      break;
+    }
+    case "getHtml": {
+      response = { html: document.documentElement.outerHTML };
+      break;
+    }
+    case "executeScript": {
+      if (!command.script) {
+        throw new Error("No script provided for execution");
+      }
+      const result = await executeJavascript(command.script);
+      response = { result };
+      break;
+    }
+    default:
+      throw new Error("Unknown command: " + command.action);
+  }
+  
+  return response;
+}
 
 // Notify background script that content script is ready
 chrome.runtime.sendMessage({ type: "CONTENT_SCRIPT_READY" }).catch(() => {

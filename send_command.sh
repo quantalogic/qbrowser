@@ -6,11 +6,20 @@
 #                      [--x <x>] [--y <y>] [--url <url>]
 #                      [--requestId <id>] [--timestamp <timestamp>]
 #
-# Example:
+# Examples:
 #   ./send_command.sh --action type --xpath '//*[@id="username"]' --text "myUserName"
+#   ./send_command.sh --action navigate --url "https://www.example.com"
 #
 # Note: Ensure API_KEY is set in your environment:
 #   export API_KEY="YOUR_SECRET_KEY"
+#
+# Supported actions:
+#   - navigate: Navigate to a URL (requires --url parameter)
+#   - type: Type text into an element (requires --xpath and --text)
+#   - click: Click an element (requires --xpath)
+#   - clickAtCoordinates: Click at specific coordinates (requires --x and --y)
+#   - getHtml: Get the page HTML
+#   - screenshot: Capture a screenshot
 #
 
 # Helper function to print usage and exit

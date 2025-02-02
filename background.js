@@ -3,6 +3,9 @@
 
 const API_URL = "ws://localhost:8765";
 const MAX_RECONNECT_INTERVAL = 10000;
+const THROTTLE_DELAY = 100; // ms between commands
+const WS_TIMEOUT = 5000; // WebSocket connection timeout
+let lastCommandTime = 0;
 let ws;
 let reconnectInterval = 1000;
 
@@ -108,11 +111,28 @@ function connectWebSocket() {
   }
 
   ws = new WebSocket(API_URL);
+  
+  // Add connection timeout
+  const connectionTimeout = setTimeout(() => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      ws.close();
+      updateConnectionStatus("Timeout");
+      scheduleReconnect();
+    }
+  }, WS_TIMEOUT);
 
   ws.addEventListener("open", () => {
+    clearTimeout(connectionTimeout);
     logInfo("Connected to WebSocket server.");
     updateConnectionStatus("Connected");
     reconnectInterval = 1000;
+
+    // Register the extension with the server
+    const registerMessage = {
+      type: "REGISTER_EXTENSION",
+      apiKey: "your_secure_key_here",
+    };
+    ws.send(JSON.stringify(registerMessage));
   });
 
   ws.addEventListener("error", (error) => {
@@ -252,81 +272,155 @@ function logCommand(command) {
 
 // Process automation commands from the WebSocket
 async function processCommand(command) {
+  // Implement request throttling
+  const now = Date.now();
+  const timeSinceLastCommand = now - lastCommandTime;
+  if (timeSinceLastCommand < THROTTLE_DELAY) {
+    await delay(THROTTLE_DELAY - timeSinceLastCommand);
+  }
+  lastCommandTime = Date.now();
+
+  // Add command timeout
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error("Command execution timed out")), 30000);
+  });
+
+  try {
+    const result = await Promise.race([
+      executeCommand(command),
+      timeoutPromise
+    ]);
+    return result;
+  } catch (error) {
+    logError(`Command execution failed: ${error.message}`);
+    throw error;
+  }
+}
+
+// New helper function to execute commands
+async function executeCommand(command) {
   if (!command.action) {
     throw new Error("Command missing action");
   }
-  
+
   logCommand(command);
-  
-  try {
-    switch (command.action) {
-      case "navigate": {
-        if (!command.url) {
-          throw new Error("URL is required for navigation");
-        }
-        const tabsNav = await queryTabs({ active: true, currentWindow: true });
-        const activeTabId = tabsNav[0]?.id;
+
+  switch (command.action) {
+    case "navigate": {
+      if (!command.url) {
+        throw new Error("URL is required for navigation");
+      }
+
+      try {
+        // Get active tab
+        const tabs = await queryTabs({ active: true, currentWindow: true });
+        const activeTabId = tabs[0]?.id;
         if (!activeTabId) {
           throw new Error("No active tab found");
         }
+
+        // Create a promise that resolves when navigation is complete
+        const navigationPromise = new Promise((resolve, reject) => {
+          const listener = (tabId, info) => {
+            if (tabId === activeTabId && info.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+
+          // Set a timeout for navigation
+          setTimeout(() => {
+            chrome.tabs.onUpdated.removeListener(listener);
+            reject(new Error('Navigation timeout'));
+          }, 30000);
+        });
+
+        // Start navigation
         await updateTab(activeTabId, { url: command.url });
-        showNotification("Navigation", `Navigating to ${command.url}`);
-        sendResponse({
+        
+        // Wait for navigation to complete
+        await navigationPromise;
+
+        // Send success response
+        const response = {
           success: true,
           requestId: command.requestId,
           action: "navigate",
           message: `Successfully navigated to ${command.url}`,
-        });
-        break;
+          timestamp: new Date().toISOString()
+        };
+        
+        sendResponse(response);
+        logInfo(`Navigation completed: ${command.url}`);
+      } catch (error) {
+        logError(`Navigation failed: ${error.message}`);
+        throw error;
       }
-      case "screenshot": {
-        logInfo("Processing screenshot command...");
-        try {
-          const dataUrl = await captureVisibleTab();
-          const response = {
-            success: true,
-            requestId: command.requestId,
-            action: "screenshot",
-            screenshot: dataUrl,
-            timestamp: new Date().toISOString(),
-          };
-          logInfo("Sending screenshot response...");
-          sendResponse(response);
-        } catch (error) {
-          throw new Error(`Screenshot failed: ${error.message}`);
-        }
-        break;
-      }
-      case "type":
-      case "click":
-      case "clickAtCoordinates":
-      case "getHtml":
-      case "executeScript": {
-        // Forward these command types to content script and await its response
-        const result = await sendMessageToContentScript(command);
-        sendResponse({
+      break;
+    }
+    case "screenshot": {
+      logInfo("Processing screenshot command...");
+      try {
+        const dataUrl = await captureVisibleTab();
+        const response = {
           success: true,
           requestId: command.requestId,
-          action: command.action,
-          result,
-          message: `Successfully executed ${command.action} command`,
-        });
-        break;
+          action: "screenshot",
+          screenshot: dataUrl,
+          timestamp: new Date().toISOString(),
+        };
+        logInfo("Sending screenshot response...");
+        sendResponse(response);
+      } catch (error) {
+        throw new Error(`Screenshot failed: ${error.message}`);
       }
-      default:
-        throw new Error(`Unknown command action: ${command.action}`);
+      break;
     }
-    logInfo(`Processed command: ${command.action}`);
-  } catch (error) {
-    logError(`Command execution failed: ${error.message}`);
-    sendResponse({
-      success: false,
-      requestId: command.requestId,
-      error: error.message,
-      action: command.action,
-    });
+    case "type":
+    case "click":
+    case "clickAtCoordinates":
+    case "getHtml":
+    case "executeScript": {
+      // Forward these command types to content script and await its response
+      const result = await sendMessageToContentScript(command);
+      sendResponse({
+        success: true,
+        requestId: command.requestId,
+        action: command.action,
+        result,
+        message: `Successfully executed ${command.action} command`,
+      });
+      break;
+    }
+    case "getHtml": {
+      // Forward these command types to content script and await its response
+      const result = await sendMessageToContentScript(command);
+      sendResponse({
+        success: true,
+        requestId: command.requestId,
+        action: command.action,
+        html: result.html, // Include the HTML content in the response
+        timestamp: new Date().toISOString(),
+        message: `Successfully retrieved HTML content`
+      });
+      break;
+    }
+    default:
+      throw new Error(`Unknown command action: ${command.action}`);
+  }
+  logInfo(`Processed command: ${command.action}`);
+}
+
+// Cleanup function for extension unload
+function cleanup() {
+  if (ws) {
+    ws.close();
   }
 }
+
+// Add cleanup listener
+chrome.runtime.onSuspend.addListener(cleanup);
 
 // Listen to messages from popup UI; for example, handling QUERY_TABS requests.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {

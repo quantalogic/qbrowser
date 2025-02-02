@@ -38,3 +38,12 @@
    ```bash
    ./send_command.sh --action screenshot --requestId req-005 --timestamp "2025-02-02T12:20:00Z"
    ```
+
+5. **Get HTML Content:**  
+   To get the HTML content of the active tab:
+
+   ```bash
+   ./send_command.sh --action getHtml
+   ```
+
+   This will return the complete HTML content of the current page.
