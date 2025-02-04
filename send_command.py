@@ -67,6 +67,11 @@ def handle_response(response: dict) -> None:
         print("\nError:")
         print(error)
         sys.exit(1)
+    if response.get("action") == "get-html":
+        print(f"URL: {response.get('url', 'N/A')}")
+        print("HTML Content:")
+        print(response.get('html', 'No HTML content retrieved'))
+        return
     if html := response.get("html"):
         snippet = "\n".join(html.splitlines()[:50])
         print("\nHTML Content (first 50 lines):")
@@ -102,6 +107,48 @@ def send_command(api_key: str, command: dict) -> str:
     logger.info(f"Command sent with Request ID: {requestId}")
     return requestId
 
+def send_html(api_key: str, html_content: str, request_id: str = None) -> str:
+    """
+    Send an HTML command to be displayed in the current browser tab.
+    
+    Args:
+        api_key (str): The API key for authentication
+        html_content (str): The HTML content to be sent and displayed
+        request_id (str, optional): A custom request ID. If not provided, one will be generated.
+    
+    Returns:
+        str: The request ID for tracking the command's status
+    """
+    command = {
+        "action": "send-html",
+        "html": html_content
+    }
+    
+    if request_id:
+        command["requestId"] = request_id
+    
+    return send_command(api_key, command)
+
+def get_html(api_key: str, request_id: str = None) -> str:
+    """
+    Retrieve HTML content from the current active browser tab.
+    
+    Args:
+        api_key (str): The API key for authentication
+        request_id (str, optional): A custom request ID. If not provided, one will be generated.
+    
+    Returns:
+        str: The request ID for tracking the command's status
+    """
+    command = {
+        "action": "get-html"
+    }
+    
+    if request_id:
+        command["requestId"] = request_id
+    
+    return send_command(api_key, command)
+
 def poll_for_answer(api_key: str, request_id: str, timeout: int = 30) -> dict:
     """
     Poll the REST API server for an answer corresponding to the given requestId.
@@ -127,6 +174,8 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--action", help="Command action (e.g. screenshot, click, etc.)")
     group.add_argument("--query", help="Query a response using a request-id")
+    group.add_argument("--html", type=str, help="HTML content to send to the browser")
+    group.add_argument("--get-html", action='store_true', help='Get HTML content from the current tab')
     
     parser.add_argument("--xpath", help="XPath selector for an element")
     parser.add_argument("--text", help="Text to type into an element")
@@ -145,6 +194,19 @@ def main():
         # Poll for answer directly using the provided request id
         answer = poll_for_answer(api_key, args.query)
         handle_response(answer)
+    elif args.get_html:
+        request_id = get_html(api_key)
+        logger.info(f"Sent get-html command. Request ID: {request_id}")
+        
+        response = poll_for_answer(api_key, request_id)
+        handle_response(response)
+    elif args.html:
+        request_id = send_html(api_key, args.html)
+        logger.info(f"Sent HTML command. Request ID: {request_id}")
+        
+        if not args.query:
+            response = poll_for_answer(api_key, request_id)
+            handle_response(response)
     else:
         command = {
             "action": args.action,

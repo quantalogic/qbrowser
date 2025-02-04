@@ -221,7 +221,7 @@ async function processCommand(command) {
     logError("processCommand: Missing command or command.action");
     return;
   }
-  logInfo("processCommand: Received command: " + JSON.stringify(command));
+  logInfo("processCommand: Received full command: " + JSON.stringify(command));
   try {
     switch (command.action) {
       case "screenshot": {
@@ -271,6 +271,76 @@ async function processCommand(command) {
           message: "Navigation successful",
           timestamp: new Date().toISOString()
         });
+        break;
+      }
+      case "send-html": {
+        if (!command.html) {
+          throw new Error("send-html command is missing HTML content");
+        }
+        const tabs = await queryTabs({ active: true, currentWindow: true });
+        if (!tabs[0]) throw new Error("No active tab found for sending HTML");
+        
+        // Inject HTML into the active tab using chrome.scripting.executeScript
+        await chrome.scripting.executeScript({
+          target: { tabId: tabs[0].id },
+          func: (html) => {
+            document.open(); 
+            document.write(html); 
+            document.close();
+          },
+          args: [command.html]
+        });
+
+        sendResponse({
+          success: true,
+          requestId: command.requestId,
+          action: "send-html",
+          message: "HTML content sent successfully",
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
+      case "get-html": {
+        logInfo("Processing get-html command");
+        const tabs = await queryTabs({ active: true, currentWindow: true });
+        logInfo(`Active tabs found: ${JSON.stringify(tabs)}`);
+        if (!tabs[0]) throw new Error("No active tab found for getting HTML");
+        
+        try {
+          // Retrieve HTML content from the active tab using chrome.scripting.executeScript
+          const htmlContent = await chrome.scripting.executeScript({
+            target: { tabId: tabs[0].id },
+            func: () => {
+              try {
+                return document.documentElement.outerHTML;
+              } catch (error) {
+                return `Error retrieving HTML: ${error.message}`;
+              }
+            }
+          });
+
+          // Log the raw result for debugging
+          logInfo(`Get HTML Result: ${JSON.stringify(htmlContent)}`);
+
+          // Check if the result exists and has the expected structure
+          if (!htmlContent || !htmlContent.length) {
+            throw new Error("No HTML content retrieved");
+          }
+
+          sendResponse({
+            success: true,
+            requestId: command.requestId,
+            action: "get-html",
+            html: htmlContent[0].result || htmlContent[0],
+            url: tabs[0].url,
+            message: "HTML content retrieved successfully",
+            timestamp: new Date().toISOString()
+          });
+        } catch (scriptError) {
+          // Log any scripting errors
+          logError(`Get HTML Script Error: ${scriptError.message}`);
+          throw scriptError;
+        }
         break;
       }
       default:
