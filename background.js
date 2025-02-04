@@ -176,6 +176,11 @@ function connectWebSocket() {
     logInfo("WebSocket MESSAGE RECEIVED: " + event.data);
     try {
       const command = JSON.parse(event.data);
+      // Handle heartbeat message
+      if (command.type === "heartbeat") {
+        ws.send(JSON.stringify({ type: "heartbeat_ack" }));
+        return;
+      }
       await processCommand(command);
     } catch (error) {
       logError("WebSocket processCommand error: " + error.message);

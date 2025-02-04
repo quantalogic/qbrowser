@@ -74,9 +74,17 @@ const server = http.createServer(app);
 // --- WEBSOCKET SETUP for the Chrome Extension
 // The extension must connect to ws://localhost:8765/ws.
 const wss = new WebSocketServer({ server, path: "/ws" });
+
+// Add heartbeat helper functions
+function noop() {}
+function heartbeat() {
+  this.isAlive = true;
+}
+
 let extensionConnection = null; // Registered extension's WebSocket
 
 wss.on("connection", (ws, req) => {
+  ws.isAlive = true;
   console.info(`[${new Date().toISOString()}][WS Connection] New connection from ${req.socket.remoteAddress}`);
   
   ws.on("message", (data) => {
@@ -113,6 +121,11 @@ wss.on("connection", (ws, req) => {
       }
       return;
     }
+    // Handle heartbeat acknowledgment
+    if (message.type === "heartbeat_ack") {
+      ws.isAlive = true;
+      return;
+    }
   });
   
   ws.on("close", () => {
@@ -122,6 +135,18 @@ wss.on("connection", (ws, req) => {
     }
   });
 });
+
+// Add heartbeat ping interval for all connected clients
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.info(`[${new Date().toISOString()}][WS] Terminating unresponsive connection.`);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.send(JSON.stringify({ type: "heartbeat" }));
+  });
+}, 30000);
 
 // Helper to flush queued commands to the extension if connected
 function flushCommandQueue() {
