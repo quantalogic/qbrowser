@@ -14,7 +14,6 @@ function logInfo(message) {
   console.info(`[INFO] ${message}`);
   try {
     chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => {
-      // Ignore errors when popup is not open
       console.debug("Popup not available for logging");
     });
   } catch (error) {
@@ -26,7 +25,6 @@ function logError(message) {
   console.error(`[ERROR] ${message}`);
   try {
     chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => {
-      // Ignore errors when popup is not open
       console.debug("Popup not available for logging");
     });
   } catch (error) {
@@ -37,7 +35,7 @@ function logError(message) {
 function showNotification(title, message) {
   chrome.notifications.create("", {
     type: "basic",
-    iconUrl: "images/q-logo-square.png", // Updated icon path
+    iconUrl: "images/q-logo-square.png",
     title,
     message,
   });
@@ -46,7 +44,6 @@ function showNotification(title, message) {
 function updateConnectionStatus(status) {
   try {
     chrome.runtime.sendMessage({ type: "CONNECTION_STATUS", payload: status }).catch(() => {
-      // Ignore errors when popup is not open
       console.debug("Popup not available for status update");
     });
   } catch (error) {
@@ -85,14 +82,11 @@ function updateTab(tabId, updateProperties) {
 
 async function captureVisibleTab() {
   try {
-    // Get the current active tab
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tabs || tabs.length === 0) {
       throw new Error("No active tab found");
     }
     const tab = tabs[0];
-
-    // Ensure the tab is fully loaded
     if (tab.status !== 'complete') {
       await new Promise(resolve => {
         const listener = (tabId, info) => {
@@ -104,15 +98,9 @@ async function captureVisibleTab() {
         chrome.tabs.onUpdated.addListener(listener);
       });
     }
-
-    // Ensure tab is focused
     await chrome.windows.update(tab.windowId, { focused: true });
     await chrome.tabs.update(tab.id, { active: true });
-
-    // Wait a brief moment for the tab to be fully focused
     await new Promise(resolve => setTimeout(resolve, 250));
-
-    // Attempt to capture screenshot
     return await new Promise((resolve, reject) => {
       chrome.tabs.captureVisibleTab(
         tab.windowId,
@@ -134,16 +122,13 @@ async function captureVisibleTab() {
   }
 }
 
-// Establish WebSocket connection with improved error handling and reconnection logic
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     logInfo("WebSocket already connected");
     return;
   }
-
   ws = new WebSocket(API_URL);
   
-  // Add connection timeout
   const connectionTimeout = setTimeout(() => {
     if (ws.readyState !== WebSocket.OPEN) {
       ws.close();
@@ -157,13 +142,15 @@ function connectWebSocket() {
     logInfo("Connected to WebSocket server.");
     updateConnectionStatus("Connected");
     reconnectInterval = 1000;
-
-    // Register the extension with the server
     const registerMessage = {
       type: "REGISTER_EXTENSION",
       apiKey: "your_secure_key_here",
     };
-    ws.send(JSON.stringify(registerMessage));
+    try {
+      ws.send(JSON.stringify(registerMessage));
+    } catch (error) {
+      logError("Failed to register extension: " + error.message);
+    }
   });
 
   ws.addEventListener("error", (error) => {
@@ -198,21 +185,17 @@ function scheduleReconnect() {
   }, reconnectInterval);
 }
 
-// Forward commands (type, click, etc.) to content scripts
 async function injectContentScriptIfNeeded(tabId) {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab) {
       throw new Error("No active tab found");
     }
-
-    // Check if content script is already injected
     try {
       await chrome.tabs.sendMessage(tabId, { type: "PING" });
       logInfo("Content script already exists");
       return;
     } catch (error) {
-      // Content script not found, inject it
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ['content.js']
@@ -242,7 +225,7 @@ async function sendMessageToContentScript(command, retries = 2) {
               if (attempt < retries && chrome.runtime.lastError.message.includes("no listener")) {
                 logInfo(`Retrying content script communication, attempt ${attempt + 1}`);
                 await injectContentScriptIfNeeded(tabs[0].id);
-                await delay(100); // Wait for script injection
+                await delay(100);
                 const result = await sendWithRetry(attempt + 1);
                 resolve(result);
               } else {
@@ -272,12 +255,10 @@ function sendResponse(response) {
     logError("WebSocket instance is null");
     return;
   }
-
   if (ws.readyState !== WebSocket.OPEN) {
     logError(`WebSocket is not open (state: ${ws.readyState})`);
     return;
   }
-
   try {
     const messageStr = JSON.stringify({
       type: "automation-response",
@@ -301,21 +282,16 @@ function logCommand(command) {
   });
 }
 
-// Process automation commands from the WebSocket
 async function processCommand(command) {
-  // Implement request throttling
   const now = Date.now();
   const timeSinceLastCommand = now - lastCommandTime;
   if (timeSinceLastCommand < THROTTLE_DELAY) {
     await delay(THROTTLE_DELAY - timeSinceLastCommand);
   }
   lastCommandTime = Date.now();
-
-  // Add command timeout
   const timeoutPromise = new Promise((_, reject) => {
     setTimeout(() => reject(new Error("Command execution timed out")), 30000);
   });
-
   try {
     const result = await Promise.race([
       executeCommand(command),
@@ -328,29 +304,23 @@ async function processCommand(command) {
   }
 }
 
-// New helper function to execute commands
 async function executeCommand(command) {
-  if (!command.action) {
-    throw new Error("Command missing action");
+  if (!command || !command.action) {
+    logError("Received command with missing action. Ignoring command.");
+    return;
   }
-
   logCommand(command);
-
   switch (command.action) {
     case "navigate": {
       if (!command.url) {
         throw new Error("URL is required for navigation");
       }
-
       try {
-        // Get active tab
         const tabs = await queryTabs({ active: true, currentWindow: true });
         const activeTabId = tabs[0]?.id;
         if (!activeTabId) {
           throw new Error("No active tab found");
         }
-
-        // Create a promise that resolves when navigation is complete
         const navigationPromise = new Promise((resolve, reject) => {
           const listener = (tabId, info) => {
             if (tabId === activeTabId && info.status === 'complete') {
@@ -359,21 +329,13 @@ async function executeCommand(command) {
             }
           };
           chrome.tabs.onUpdated.addListener(listener);
-
-          // Set a timeout for navigation
           setTimeout(() => {
             chrome.tabs.onUpdated.removeListener(listener);
             reject(new Error('Navigation timeout'));
           }, 30000);
         });
-
-        // Start navigation
         await updateTab(activeTabId, { url: command.url });
-        
-        // Wait for navigation to complete
         await navigationPromise;
-
-        // Send success response
         const response = {
           success: true,
           requestId: command.requestId,
@@ -381,7 +343,6 @@ async function executeCommand(command) {
           message: `Successfully navigated to ${command.url}`,
           timestamp: new Date().toISOString()
         };
-        
         sendResponse(response);
         logInfo(`Navigation completed: ${command.url}`);
       } catch (error) {
@@ -393,14 +354,11 @@ async function executeCommand(command) {
     case "screenshot": {
       logInfo("Processing screenshot command...");
       try {
-        // Wait briefly to ensure the tab is ready
         await delay(100);
-        // Validate that the active tab is using HTTP/HTTPS to prevent capturing non-web pages
         const tabs = await queryTabs({ active: true, currentWindow: true });
         if (!tabs[0] || !tabs[0].url || !/^https?:\/\//.test(tabs[0].url)) {
           throw new Error("Screenshot capture is only allowed on HTTP/HTTPS pages");
         }
-
         const dataUrl = await captureVisibleTab();
         const response = {
           success: true,
@@ -429,7 +387,6 @@ async function executeCommand(command) {
     case "clickAtCoordinates":
     case "getHtml":
     case "executeScript": {
-      // Forward these command types to content script and await its response
       const result = await sendMessageToContentScript(command);
       sendResponse({
         success: true,
@@ -441,13 +398,12 @@ async function executeCommand(command) {
       break;
     }
     case "getHtml": {
-      // Forward these command types to content script and await its response
       const result = await sendMessageToContentScript(command);
       sendResponse({
         success: true,
         requestId: command.requestId,
         action: command.action,
-        html: result.html, // Include the HTML content in the response
+        html: result.html,
         timestamp: new Date().toISOString(),
         message: `Successfully retrieved HTML content`
       });
@@ -459,17 +415,14 @@ async function executeCommand(command) {
   logInfo(`Processed command: ${command.action}`);
 }
 
-// Cleanup function for extension unload
 function cleanup() {
   if (ws) {
     ws.close();
   }
 }
 
-// Add cleanup listener
 chrome.runtime.onSuspend.addListener(cleanup);
 
-// Listen to messages from popup UI; for example, handling QUERY_TABS requests.
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "QUERY_TABS") {
     chrome.tabs.query({}, (tabs) => {
@@ -483,5 +436,4 @@ chrome.runtime.onInstalled.addListener(() => {
   logInfo("QBrowser extension installed");
 });
 
-// Initialize the WebSocket connection.
 connectWebSocket();

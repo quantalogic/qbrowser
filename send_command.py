@@ -37,7 +37,6 @@ from datetime import datetime, timezone
 import uuid
 import websockets
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -49,15 +48,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def generate_request_id() -> str:
-    # Generate a unique request ID using uuid4.
     return str(uuid.uuid4())
 
 def save_screenshot(data: str) -> str:
-    """
-    Decode a base64-encoded screenshot (with a data URI prefix)
-    and save it to a PNG file.
-    Returns the filename.
-    """
     if isinstance(data, dict) and "data" in data:
         data = data["data"]
     if isinstance(data, str) and data.startswith("data:image/png;base64,"):
@@ -70,10 +63,6 @@ def save_screenshot(data: str) -> str:
     return filename
 
 def handle_response(response: dict) -> None:
-    """
-    Unwrap and display the final response.
-    If a screenshot is provided, save it.
-    """
     if "payload" in response:
         response = response["payload"]
     print("\nCommand Response:")
@@ -103,16 +92,11 @@ def handle_response(response: dict) -> None:
         print(message)
 
 async def send_message(ws, message: dict) -> None:
-    """Send a JSON message over the WebSocket."""
     logger.info("📤 Sending message")
     logger.debug(f"Message details: {json.dumps(message, indent=2)}")
     await ws.send(json.dumps(message))
 
 async def wait_for_automation_response(ws) -> dict:
-    """
-    Loop reading messages on the connection until one has type "automation-response".
-    Other messages (such as extension_status) are logged and ignored.
-    """
     while True:
         try:
             raw = await ws.recv()
@@ -128,12 +112,10 @@ async def wait_for_automation_response(ws) -> dict:
                 logger.info("🎉 Valid response received!")
                 logger.debug(f"Response payload: {json.dumps(msg, indent=2)}")
                 return msg
-            # If no explicit type but the payload looks like an automation response, use it.
             if msg_type is None and "payload" in msg and msg.get("payload", {}).get("action"):
                 logger.info("🎉 Valid response received!")
                 logger.debug(f"Response payload: {json.dumps(msg, indent=2)}")
                 return msg
-            # Log ignored messages.
             logger.warning(f"⚠️ Ignoring message of type: {msg.get('type')}")
         except asyncio.TimeoutError:
             logger.error("⏰ No response received within 30 seconds")
@@ -143,10 +125,6 @@ async def wait_for_automation_response(ws) -> dict:
             return None
 
 async def automation_command(command: dict, timeout: int = 5) -> None:
-    """
-    Open a WebSocket connection, send the automation command, and await an automation-response.
-    If connection closes too early, automatically fall back to a query.
-    """
     api_key = command["apiKey"]
     request_id = command["requestId"]
     try:
@@ -172,10 +150,6 @@ async def automation_command(command: dict, timeout: int = 5) -> None:
         sys.exit(1)
 
 async def query_response(query: dict, timeout: int = 30) -> None:
-    """
-    Open a WebSocket connection, send a query message (type "query-response"),
-    and wait for the stored result.
-    """
     try:
         logger.info("🔌 Attempting connection to WebSocket server")
         async with websockets.connect("ws://localhost:8765") as ws:

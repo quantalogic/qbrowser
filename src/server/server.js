@@ -5,6 +5,7 @@
     – Relays automation commands from clients to a registered browser extension.
     – Stores automation responses keyed by requestId (with a TTL) so that clients
       may later query for the result even if their connection closes.
+    – Queues automation commands if the extension is not connected and flushes them upon reconnection.
 
 Message types:
   • "REGISTER_EXTENSION": Used by the extension to register. (API key verified.)
@@ -35,7 +36,6 @@ const logger = {
     console.error(`[${new Date().toISOString()}][${context}]`, message),
 };
 
-// Connection state constants.
 const ConnectionState = {
   DISCONNECTED: "disconnected",
   CONNECTING: "connecting",
@@ -51,6 +51,7 @@ let extensionStatus = {
 
 let extensionConnection = null; // The registered extension's WebSocket.
 const clientConnections = new Map(); // Maps requestId => client WebSocket.
+const commandQueue = []; // Queue for automation commands when extension is not connected.
 
 // In-memory store for automation responses (keyed by requestId).
 const storedResults = new Map();
@@ -100,8 +101,12 @@ function sendErrorResponse(ws, error, requestId) {
     requestId,
     timestamp: new Date().toISOString(),
   };
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(errMsg));
+  try {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(errMsg));
+    }
+  } catch (err) {
+    logger.error("SendErrorResponse", err.message);
   }
 }
 
@@ -117,13 +122,37 @@ function updateExtensionStatus(status, errorInfo) {
   // Optionally notify clients.
   for (const clientWs of clientConnections.values()) {
     if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(
-        JSON.stringify({
-          type: "extension_status",
-          status: extensionStatus,
-          timestamp: new Date().toISOString(),
-        })
-      );
+      try {
+        clientWs.send(
+          JSON.stringify({
+            type: "extension_status",
+            status: extensionStatus,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch (err) {
+        logger.error("UpdateExtensionStatus", err.message);
+      }
+    }
+  }
+}
+
+/**
+ * Flush queued automation commands to the extension.
+ */
+function flushAutomationCommandQueue() {
+  if (extensionConnection && extensionConnection.ws.readyState === WebSocket.OPEN) {
+    while (commandQueue.length > 0) {
+      const queuedCommand = commandQueue.shift();
+      try {
+        extensionConnection.ws.send(JSON.stringify(queuedCommand));
+        logger.info("Relay", { message: "Flushed queued command", command: queuedCommand });
+      } catch (err) {
+        logger.error("FlushQueue", err.message);
+        // If sending fails, push it back for retries.
+        commandQueue.unshift(queuedCommand);
+        break;
+      }
     }
   }
 }
@@ -167,6 +196,8 @@ function handleMessage(ws, messageStr) {
         timestamp: new Date().toISOString(),
       })
     );
+    // Flush any queued automation commands
+    flushAutomationCommandQueue();
     return;
   }
 
@@ -186,7 +217,11 @@ function handleMessage(ws, messageStr) {
       });
       const clientWs = clientConnections.get(message.payload.requestId);
       if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify(message));
+        try {
+          clientWs.send(JSON.stringify(message));
+        } catch (err) {
+          logger.error("Relay", err.message);
+        }
         clientConnections.delete(message.payload.requestId);
       }
     }
@@ -216,17 +251,19 @@ function handleMessage(ws, messageStr) {
     if (message.requestId) {
       clientConnections.set(message.requestId, ws);
     }
-    if (
-      !extensionConnection ||
-      extensionConnection.ws.readyState !== WebSocket.OPEN
-    ) {
-      const errMsg = `Extension not connected (status: ${extensionStatus.state})`;
-      logger.error("Relay", errMsg);
-      sendErrorResponse(ws, errMsg, message.requestId);
+    if (!extensionConnection || extensionConnection.ws.readyState !== WebSocket.OPEN) {
+      // Instead of rejecting outright, queue the command.
+      logger.info("Relay", "Extension not connected. Queuing command for later delivery.");
+      commandQueue.push(message);
       return;
     }
     logger.info("Relay", { command: message });
-    extensionConnection.ws.send(JSON.stringify(message));
+    try {
+      extensionConnection.ws.send(JSON.stringify(message));
+    } catch (err) {
+      logger.error("Relay Send", err.message);
+      sendErrorResponse(ws, err.message, message.requestId);
+    }
     return;
   }
 
@@ -289,10 +326,7 @@ wss.on("connection", (ws, req) => {
 });
 
 setInterval(() => {
-  if (
-    extensionConnection &&
-    extensionConnection.ws.readyState === WebSocket.OPEN
-  ) {
+  if (extensionConnection && extensionConnection.ws.readyState === WebSocket.OPEN) {
     try {
       extensionConnection.ws.ping();
     } catch (err) {

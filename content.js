@@ -11,9 +11,6 @@ function logError(error, context) {
   };
 }
 
-/**
- * Simulate a mouse click event on an element.
- */
 function simulateClick(element) {
   const clickEvent = new MouseEvent("click", {
     view: window,
@@ -23,9 +20,6 @@ function simulateClick(element) {
   element.dispatchEvent(clickEvent);
 }
 
-/**
- * Retrieve an element by its XPath.
- */
 function getElementByXPath(xpath) {
   return document.evaluate(
     xpath,
@@ -36,9 +30,6 @@ function getElementByXPath(xpath) {
   ).singleNodeValue;
 }
 
-/**
- * Execute a click at specific coordinates.
- */
 function clickAtCoordinates(x, y) {
   const element = document.elementFromPoint(x, y);
   if (element) {
@@ -48,9 +39,6 @@ function clickAtCoordinates(x, y) {
   }
 }
 
-/**
- * Type text into a provided element.
- */
 function typeText(element, text) {
   element.focus();
   element.value = text;
@@ -58,15 +46,11 @@ function typeText(element, text) {
   element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-/**
- * Execute arbitrary JavaScript code with timeout.
- */
 function executeJavascript(script) {
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
       reject(new Error("Script execution timed out after 5000ms"));
     }, 5000);
-
     try {
       const func = new Function(script);
       const result = func();
@@ -79,30 +63,27 @@ function executeJavascript(script) {
   });
 }
 
-// Add cleanup handler
 const cleanup = () => {
-  // Cleanup any ongoing operations
   chrome.runtime.onMessage.removeListener(messageListener);
 };
 
-// Store listener reference for cleanup
 const messageListener = async (request, sender, sendResponse) => {
   if (request.type === "PING") {
     sendResponse({ status: "OK" });
     return;
   }
-
   if (request.type !== "automation-command") {
     return;
   }
-
   const command = request.payload;
-  
-  // Add execution timeout
+  // Ensure document is ready
+  if (!document || !document.documentElement) {
+    sendResponse(logError(new Error("Document not ready"), "document_ready"));
+    return true;
+  }
   const timeoutPromise = new Promise((_, reject) => {
     setTimeout(() => reject(new Error("Command execution timed out")), 10000);
   });
-
   try {
     const result = await Promise.race([
       processCommand(command),
@@ -112,23 +93,18 @@ const messageListener = async (request, sender, sendResponse) => {
   } catch (error) {
     sendResponse(logError(error, command.action));
   }
-  
   return true;
 };
 
 chrome.runtime.onMessage.addListener(messageListener);
 
-// Cleanup on unload
 window.addEventListener('unload', cleanup);
 
 async function processCommand(command) {
   let response = { success: true };
-  
-  // Add context verification
   if (!document.documentElement) {
     throw new Error("Document not ready");
   }
-
   switch (command.action) {
     case "click": {
       let element = command.xpath
@@ -175,11 +151,9 @@ async function processCommand(command) {
     default:
       throw new Error("Unknown command: " + command.action);
   }
-  
   return response;
 }
 
-// Notify background script that content script is ready
 chrome.runtime.sendMessage({ type: "CONTENT_SCRIPT_READY" }).catch(() => {
   console.debug("Background script not ready");
 });

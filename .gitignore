@@ -68,3 +68,7 @@ jspm_packages/
 
 # Electron-builder output
 dist/
+
+# Python virtual environment
+.venv/
+venv/
