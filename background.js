@@ -343,6 +343,25 @@ async function processCommand(command) {
         }
         break;
       }
+      case "get-html-no-scripts": {
+        const tab = await queryTabs({ active: true, currentWindow: true });
+        const html = await chrome.tabs.executeScript(tab[0].id, {
+          code: `(() => {
+            const clone = document.documentElement.cloneNode(true);
+            clone.querySelectorAll('script, noscript').forEach(n => n.remove());
+            return clone.outerHTML;
+          })()`
+        });
+        sendResponse({
+          success: true,
+          requestId: command.requestId,
+          action: "get-html-no-scripts",
+          html: html[0],
+          url: tab[0].url,
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
       default:
         throw new Error("Unknown command action: " + command.action);
     }

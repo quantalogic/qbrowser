@@ -126,6 +126,20 @@ wss.on("connection", (ws, req) => {
       ws.isAlive = true;
       return;
     }
+    // Handle command routing
+    if (message.type === "command-routing") {
+      switch (message.command) {
+        case 'get-html-no-scripts':
+          ws.send(JSON.stringify({
+            type: 'command',
+            command: message.command,
+            requestId: message.requestId
+          }));
+          break;
+        default:
+          console.error(`Unknown command: ${message.command}`);
+      }
+    }
   });
   
   ws.on("close", () => {
