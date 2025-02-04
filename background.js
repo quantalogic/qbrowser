@@ -1,35 +1,27 @@
-// background.js
 "use strict";
 
-const API_URL = "ws://localhost:8765";
-const MAX_RECONNECT_INTERVAL = 10000;
-const THROTTLE_DELAY = 100; // ms between commands
-const WS_TIMEOUT = 5000; // WebSocket connection timeout
-let lastCommandTime = 0;
-let ws;
-let reconnectInterval = 1000;
+// Configuration
+const API_URL = "ws://localhost:8765/ws"; // WebSocket server endpoint
+const WS_TIMEOUT = 5000; // 5 seconds timeout
 
-// Logging functions using basic log levels
+let ws = null;
+let reconnectInterval = 1000; // initial reconnect interval
+
+//////////////////////
+// Logging Helpers  //
+//////////////////////
 function logInfo(message) {
   console.info(`[INFO] ${message}`);
   try {
-    chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => {
-      console.debug("Popup not available for logging");
-    });
-  } catch (error) {
-    console.debug("Failed to send log message", error);
-  }
+    chrome.runtime.sendMessage({ type: "LOG", payload: message });
+  } catch (e) { }
 }
 
 function logError(message) {
   console.error(`[ERROR] ${message}`);
   try {
-    chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => {
-      console.debug("Popup not available for logging");
-    });
-  } catch (error) {
-    console.debug("Failed to send error message", error);
-  }
+    chrome.runtime.sendMessage({ type: "LOG", payload: message });
+  } catch (e) { }
 }
 
 function showNotification(title, message) {
@@ -41,27 +33,21 @@ function showNotification(title, message) {
   });
 }
 
-function updateConnectionStatus(status) {
-  try {
-    chrome.runtime.sendMessage({ type: "CONNECTION_STATUS", payload: status }).catch(() => {
-      console.debug("Popup not available for status update");
-    });
-  } catch (error) {
-    console.debug("Failed to update connection status", error);
-  }
-}
-
+//////////////////////
+// Utility Functions//
+//////////////////////
 function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Promise wrappers for Chrome API callbacks
 function queryTabs(queryOpts) {
   return new Promise((resolve, reject) => {
+    logInfo("queryTabs: " + JSON.stringify(queryOpts));
     chrome.tabs.query(queryOpts, (tabs) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else {
+        logInfo("queryTabs: Found " + tabs.length + " tab(s).");
         resolve(tabs);
       }
     });
@@ -70,260 +56,199 @@ function queryTabs(queryOpts) {
 
 function updateTab(tabId, updateProperties) {
   return new Promise((resolve, reject) => {
+    logInfo(`updateTab: Updating tab ${tabId} with ${JSON.stringify(updateProperties)}`);
     chrome.tabs.update(tabId, updateProperties, (tab) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else {
+        logInfo(`updateTab: Tab ${tabId} updated.`);
         resolve(tab);
       }
     });
   });
 }
 
+function getCurrentWindow() {
+  return new Promise((resolve, reject) => {
+    logInfo("getCurrentWindow: Getting current window");
+    chrome.windows.getCurrent((win) => {
+      if (chrome.runtime.lastError || !win) {
+        reject(new Error(chrome.runtime.lastError ? chrome.runtime.lastError.message : "No active window"));
+      } else {
+        logInfo("getCurrentWindow: Got window id " + win.id);
+        resolve(win);
+      }
+    });
+  });
+}
+
+//////////////////////////
+// Screenshot Mechanism //
+//////////////////////////
 async function captureVisibleTab() {
   try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tabs || tabs.length === 0) {
+    logInfo("captureVisibleTab: Initiating screenshot capture");
+    const tabs = await queryTabs({ active: true, currentWindow: true });
+    if (tabs.length === 0) {
       throw new Error("No active tab found");
     }
-    const tab = tabs[0];
-    if (tab.status !== 'complete') {
+    const activeTab = tabs[0];
+    logInfo(`captureVisibleTab: Active tab id=${activeTab.id}, url=${activeTab.url}, status=${activeTab.status}`);
+    if (activeTab.status !== "complete") {
+      logInfo("captureVisibleTab: Waiting for tab to finish loading...");
       await new Promise(resolve => {
         const listener = (tabId, info) => {
-          if (tabId === tab.id && info.status === 'complete') {
+          if (tabId === activeTab.id && info.status === "complete") {
             chrome.tabs.onUpdated.removeListener(listener);
+            logInfo("captureVisibleTab: Tab finished loading.");
             resolve();
           }
         };
         chrome.tabs.onUpdated.addListener(listener);
       });
     }
-    await chrome.windows.update(tab.windowId, { focused: true });
-    await chrome.tabs.update(tab.id, { active: true });
-    await new Promise(resolve => setTimeout(resolve, 250));
+    const win = await getCurrentWindow();
+    logInfo(`captureVisibleTab: Will capture from window id ${win.id}`);
+    await updateTab(activeTab.id, { active: true });
+    chrome.windows.update(win.id, { focused: true });
+    logInfo("captureVisibleTab: Focus set. Waiting 300ms for stabilization.");
+    await delay(300);
     return await new Promise((resolve, reject) => {
-      chrome.tabs.captureVisibleTab(
-        tab.windowId,
-        { format: 'png' },
-        (dataUrl) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(`Screenshot failed: ${chrome.runtime.lastError.message}`));
-          } else if (!dataUrl) {
-            reject(new Error('Screenshot capture returned empty result'));
-          } else {
-            resolve(dataUrl);
-          }
+      logInfo("captureVisibleTab: Invoking chrome.tabs.captureVisibleTab...");
+      chrome.tabs.captureVisibleTab(win.id, { format: "png" }, (dataUrl) => {
+        if (chrome.runtime.lastError) {
+          return reject(new Error("captureVisibleTab: " + chrome.runtime.lastError.message));
         }
-      );
+        if (!dataUrl) {
+          return reject(new Error("captureVisibleTab: Empty screenshot result"));
+        }
+        logInfo("captureVisibleTab: Captured screenshot (dataUrl length: " + dataUrl.length + ")");
+        resolve(dataUrl);
+      });
     });
   } catch (error) {
-    logError(`Screenshot capture failed: ${error.message}`);
+    logError("captureVisibleTab ERROR: " + error.message);
     throw error;
   }
 }
 
+//////////////////////////////
+// WebSocket Relay Mechanism//
+//////////////////////////////
 function connectWebSocket() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    logInfo("WebSocket already connected");
+    logInfo("connectWebSocket: WebSocket already open");
     return;
   }
+  logInfo("connectWebSocket: Connecting to " + API_URL);
   ws = new WebSocket(API_URL);
-  
-  const connectionTimeout = setTimeout(() => {
+  const wsConnectionTimeout = setTimeout(() => {
     if (ws.readyState !== WebSocket.OPEN) {
+      logError("connectWebSocket: Connection timed out - closing WebSocket");
       ws.close();
-      updateConnectionStatus("Timeout");
       scheduleReconnect();
     }
   }, WS_TIMEOUT);
-
   ws.addEventListener("open", () => {
-    clearTimeout(connectionTimeout);
-    logInfo("Connected to WebSocket server.");
-    updateConnectionStatus("Connected");
-    reconnectInterval = 1000;
-    const registerMessage = {
+    clearTimeout(wsConnectionTimeout);
+    logInfo("WebSocket CONNECTED");
+    const registerMsg = {
       type: "REGISTER_EXTENSION",
-      apiKey: "your_secure_key_here",
+      apiKey: "DEFAULT_SECRET"
     };
     try {
-      ws.send(JSON.stringify(registerMessage));
+      ws.send(JSON.stringify(registerMsg));
+      logInfo("WebSocket: Sent registration message");
     } catch (error) {
-      logError("Failed to register extension: " + error.message);
+      logError("WebSocket registration error: " + error.message);
     }
+    reconnectInterval = 1000;
   });
-
   ws.addEventListener("error", (error) => {
     logError("WebSocket error: " + JSON.stringify(error));
-    updateConnectionStatus("Error");
     scheduleReconnect();
   });
-
   ws.addEventListener("close", (event) => {
-    logInfo(`WebSocket closed: ${event.code} ${event.reason}`);
-    updateConnectionStatus("Disconnected");
+    logInfo("WebSocket closed: " + event.code + " " + event.reason);
     scheduleReconnect();
   });
-
   ws.addEventListener("message", async (event) => {
-    logInfo("Received message from server: " + event.data);
+    logInfo("WebSocket MESSAGE RECEIVED: " + event.data);
     try {
       const command = JSON.parse(event.data);
       await processCommand(command);
     } catch (error) {
-      logError("Failed to process command: " + error.message);
-      showNotification("Error", "Failed to process command");
+      logError("WebSocket processCommand error: " + error.message);
+      showNotification("Extension Error", error.message);
     }
   });
 }
 
 function scheduleReconnect() {
+  logInfo(`scheduleReconnect: Attempting reconnect in ${reconnectInterval}ms`);
   setTimeout(() => {
-    logInfo(`Attempting reconnect in ${reconnectInterval}ms`);
     connectWebSocket();
-    reconnectInterval = Math.min(reconnectInterval * 2, MAX_RECONNECT_INTERVAL);
+    reconnectInterval = Math.min(reconnectInterval * 2, 10000);
   }, reconnectInterval);
 }
 
-async function injectContentScriptIfNeeded(tabId) {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) {
-      throw new Error("No active tab found");
-    }
-    try {
-      await chrome.tabs.sendMessage(tabId, { type: "PING" });
-      logInfo("Content script already exists");
-      return;
-    } catch (error) {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['content.js']
-      });
-      logInfo(`Content script injected into tab ${tabId}`);
-    }
-  } catch (error) {
-    logError(`Failed to inject content script: ${error.message}`);
-    throw error;
-  }
-}
-
-async function sendMessageToContentScript(command, retries = 2) {
-  const tabs = await queryTabs({ active: true, currentWindow: true });
-  if (!tabs[0]?.id) {
-    throw new Error("No active tab found");
-  }
-  
-  const sendWithRetry = async (attempt) => {
-    try {
-      return await new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(
-          tabs[0].id,
-          { type: "automation-command", payload: command },
-          async (response) => {
-            if (chrome.runtime.lastError) {
-              if (attempt < retries && chrome.runtime.lastError.message.includes("no listener")) {
-                logInfo(`Retrying content script communication, attempt ${attempt + 1}`);
-                await injectContentScriptIfNeeded(tabs[0].id);
-                await delay(100);
-                const result = await sendWithRetry(attempt + 1);
-                resolve(result);
-              } else {
-                reject(new Error(`Content script communication failed: ${chrome.runtime.lastError.message}`));
-              }
-              return;
-            }
-            resolve(response);
-          }
-        );
-      });
-    } catch (error) {
-      if (attempt < retries) {
-        logInfo(`Retrying after error: ${error.message}`);
-        await delay(100 * Math.pow(2, attempt));
-        return sendWithRetry(attempt + 1);
-      }
-      throw error;
-    }
-  };
-
-  return sendWithRetry(0);
-}
-
 function sendResponse(response) {
-  if (!ws) {
-    logError("WebSocket instance is null");
-    return;
-  }
-  if (ws.readyState !== WebSocket.OPEN) {
-    logError(`WebSocket is not open (state: ${ws.readyState})`);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    logError("sendResponse: WebSocket unavailable to send response");
     return;
   }
   try {
-    const messageStr = JSON.stringify({
-      type: "automation-response",
-      payload: response,
-    });
-    logInfo(`Sending response (${messageStr.length} bytes)`);
+    const messageObj = { type: "automation-response", payload: response };
+    const messageStr = JSON.stringify(messageObj);
+    logInfo(`sendResponse: Sending response for action (${response.action}) - ${messageStr.length} bytes`);
     ws.send(messageStr);
-    logInfo("Response sent successfully");
+    logInfo("sendResponse: Response sent");
   } catch (error) {
-    logError(`Failed to send response: ${error.message}`);
+    logError("sendResponse error: " + error.message);
   }
 }
 
-function logCommand(command) {
-  const message = `Command received: ${command.action} ${JSON.stringify(command)}`;
-  console.info(`[COMMAND] ${message}`);
-  chrome.runtime.sendMessage({ 
-    type: "LOG", 
-    payload: message,
-    level: "command"
-  });
-}
-
+////////////////////////////////////
+// Command Processing & Routing   //
+////////////////////////////////////
 async function processCommand(command) {
-  const now = Date.now();
-  const timeSinceLastCommand = now - lastCommandTime;
-  if (timeSinceLastCommand < THROTTLE_DELAY) {
-    await delay(THROTTLE_DELAY - timeSinceLastCommand);
-  }
-  lastCommandTime = Date.now();
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error("Command execution timed out")), 30000);
-  });
-  try {
-    const result = await Promise.race([
-      executeCommand(command),
-      timeoutPromise
-    ]);
-    return result;
-  } catch (error) {
-    logError(`Command execution failed: ${error.message}`);
-    throw error;
-  }
-}
-
-async function executeCommand(command) {
   if (!command || !command.action) {
-    logError("Received command with missing action. Ignoring command.");
+    logError("processCommand: Missing command or command.action");
     return;
   }
-  logCommand(command);
-  switch (command.action) {
-    case "navigate": {
-      if (!command.url) {
-        throw new Error("URL is required for navigation");
-      }
-      try {
+  logInfo("processCommand: Received command: " + JSON.stringify(command));
+  try {
+    switch (command.action) {
+      case "screenshot": {
+        // Process screenshot command without relying on command.url (check active tab's URL if exists)
         const tabs = await queryTabs({ active: true, currentWindow: true });
-        const activeTabId = tabs[0]?.id;
-        if (!activeTabId) {
-          throw new Error("No active tab found");
+        if (!tabs[0]) {
+          throw new Error("No active tab found for screenshot");
         }
-        const navigationPromise = new Promise((resolve, reject) => {
+        // If tab.url exists, enforce HTTP/HTTPS; otherwise, allow the screenshot to proceed.
+        if (tabs[0].url && !/^https?:\/\//.test(tabs[0].url)) {
+          throw new Error("Screenshots are only allowed on HTTP/HTTPS pages");
+        }
+        const dataUrl = await captureVisibleTab();
+        sendResponse({
+          success: true,
+          requestId: command.requestId,
+          action: "screenshot",
+          screenshot: dataUrl,
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
+      case "navigate": {
+        if (!command.url) {
+          throw new Error("navigate command is missing URL");
+        }
+        const tabs = await queryTabs({ active: true, currentWindow: true });
+        if (!tabs[0]) throw new Error("No active tab found for navigation");
+        await updateTab(tabs[0].id, { url: command.url });
+        await new Promise((resolve, reject) => {
           const listener = (tabId, info) => {
-            if (tabId === activeTabId && info.status === 'complete') {
+            if (tabId === tabs[0].id && info.status === "complete") {
               chrome.tabs.onUpdated.removeListener(listener);
               resolve();
             }
@@ -331,109 +256,48 @@ async function executeCommand(command) {
           chrome.tabs.onUpdated.addListener(listener);
           setTimeout(() => {
             chrome.tabs.onUpdated.removeListener(listener);
-            reject(new Error('Navigation timeout'));
+            reject(new Error("Navigation timed out"));
           }, 30000);
         });
-        await updateTab(activeTabId, { url: command.url });
-        await navigationPromise;
-        const response = {
+        sendResponse({
           success: true,
           requestId: command.requestId,
           action: "navigate",
-          message: `Successfully navigated to ${command.url}`,
+          message: "Navigation successful",
           timestamp: new Date().toISOString()
-        };
-        sendResponse(response);
-        logInfo(`Navigation completed: ${command.url}`);
-      } catch (error) {
-        logError(`Navigation failed: ${error.message}`);
-        throw error;
+        });
+        break;
       }
-      break;
+      default:
+        throw new Error("Unknown command action: " + command.action);
     }
-    case "screenshot": {
-      logInfo("Processing screenshot command...");
-      try {
-        await delay(100);
-        const tabs = await queryTabs({ active: true, currentWindow: true });
-        if (!tabs[0] || !tabs[0].url || !/^https?:\/\//.test(tabs[0].url)) {
-          throw new Error("Screenshot capture is only allowed on HTTP/HTTPS pages");
-        }
-        const dataUrl = await captureVisibleTab();
-        const response = {
-          success: true,
-          requestId: command.requestId,
-          action: "screenshot",
-          screenshot: dataUrl,
-          timestamp: new Date().toISOString(),
-        };
-        logInfo("Screenshot captured successfully");
-        sendResponse(response);
-      } catch (error) {
-        const errorResponse = {
-          success: false,
-          requestId: command.requestId,
-          action: "screenshot",
-          error: error.message,
-          timestamp: new Date().toISOString(),
-        };
-        sendResponse(errorResponse);
-        throw error;
-      }
-      break;
-    }
-    case "type":
-    case "click":
-    case "clickAtCoordinates":
-    case "getHtml":
-    case "executeScript": {
-      const result = await sendMessageToContentScript(command);
-      sendResponse({
-        success: true,
-        requestId: command.requestId,
-        action: command.action,
-        result,
-        message: `Successfully executed ${command.action} command`,
-      });
-      break;
-    }
-    case "getHtml": {
-      const result = await sendMessageToContentScript(command);
-      sendResponse({
-        success: true,
-        requestId: command.requestId,
-        action: command.action,
-        html: result.html,
-        timestamp: new Date().toISOString(),
-        message: `Successfully retrieved HTML content`
-      });
-      break;
-    }
-    default:
-      throw new Error(`Unknown command action: ${command.action}`);
+    logInfo("processCommand: Processed command successfully: " + command.action);
+  } catch (error) {
+    logError("processCommand error (" + command.action + "): " + error.message);
+    sendResponse({
+      success: false,
+      requestId: command.requestId,
+      action: command.action,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
-  logInfo(`Processed command: ${command.action}`);
 }
 
+//////////////////////
+// Cleanup on suspend
+//////////////////////
 function cleanup() {
   if (ws) {
     ws.close();
   }
 }
-
 chrome.runtime.onSuspend.addListener(cleanup);
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === "QUERY_TABS") {
-    chrome.tabs.query({}, (tabs) => {
-      sendResponse({ tabs });
-    });
-    return true;
-  }
-});
-
+//////////////////////
+// Initialization
+//////////////////////
 chrome.runtime.onInstalled.addListener(() => {
-  logInfo("QBrowser extension installed");
+  logInfo("Extension installed and running");
 });
-
 connectWebSocket();

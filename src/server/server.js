@@ -1,336 +1,148 @@
-// src/server/server.js
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import cors from "cors";
+import { v4 as uuidv4 } from "uuid";
 
-/*
-  A stateful WebSocket server that:
-    – Relays automation commands from clients to a registered browser extension.
-    – Stores automation responses keyed by requestId (with a TTL) so that clients
-      may later query for the result even if their connection closes.
-    – Queues automation commands if the extension is not connected and flushes them upon reconnection.
-
-Message types:
-  • "REGISTER_EXTENSION": Used by the extension to register. (API key verified.)
-  • "automation-command": Sent by a client (must include a unique requestId).
-  • "automation-response": Sent by the extension in reply.
-       The server forwards it to the originating client and stores it.
-  • "query-response": Sent by a client to retrieve a stored result.
-*/
-
-import { WebSocketServer, WebSocket } from "ws";
-import { config } from "dotenv";
-import { fileURLToPath } from "url";
-import { dirname } from "path";
-
-config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const PORT = 8765;
 const API_KEY = process.env.API_KEY || "DEFAULT_SECRET";
+const PORT = process.env.PORT || 8765;
 
-// Logger utility.
-const logger = {
-  info: (context, message) =>
-    console.info(`[${new Date().toISOString()}][${context}]`, message),
-  error: (context, message) =>
-    console.error(`[${new Date().toISOString()}][${context}]`, message),
-};
+// --- EXPRESS SETUP for REST API endpoints (used by the Python client)
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
-const ConnectionState = {
-  DISCONNECTED: "disconnected",
-  CONNECTING: "connecting",
-  CONNECTED: "connected",
-  DISCONNECTING: "disconnecting",
-  ERROR: "error",
-};
+// In-memory storage for commands and answers
+const commandQueue = []; // Queue for pending automation commands
+const answers = {}; // { requestId: { result, timestamp } }
+const ANSWER_TTL = 5 * 60 * 1000; // 5 minutes
 
-let extensionStatus = {
-  state: ConnectionState.DISCONNECTED,
-  lastUpdated: Date.now(),
-};
-
-let extensionConnection = null; // The registered extension's WebSocket.
-const clientConnections = new Map(); // Maps requestId => client WebSocket.
-const commandQueue = []; // Queue for automation commands when extension is not connected.
-
-// In-memory store for automation responses (keyed by requestId).
-const storedResults = new Map();
-// TTL (in milliseconds) for stored responses.
-const RESULT_TTL = 5 * 60 * 1000; // 5 minutes
-
-const HEARTBEAT_INTERVAL = 30000; // 30 seconds.
-const HEARTBEAT_TIMEOUT = 35000; // 35 seconds.
-
-// Clean up expired stored results.
+// Cleanup expired answers every minute
 setInterval(() => {
   const now = Date.now();
-  for (const [requestId, { timestamp }] of storedResults.entries()) {
-    if (now - timestamp > RESULT_TTL) {
-      storedResults.delete(requestId);
-      logger.info(
-        "Cleanup",
-        `Deleted stored result for requestId: ${requestId}`
-      );
+  for (const requestId in answers) {
+    if (now - answers[requestId].timestamp > ANSWER_TTL) {
+      delete answers[requestId];
+      console.info(`[${new Date().toISOString()}][Cleanup] Deleted answer for requestId: ${requestId}`);
     }
   }
 }, 60000);
 
-// Check extension heartbeat.
-setInterval(() => {
-  if (extensionConnection) {
-    const now = Date.now();
-    if (now - extensionConnection.lastHeartbeat > HEARTBEAT_TIMEOUT) {
-      logger.error(
-        "Extension",
-        "Heartbeat timeout, closing extension connection."
-      );
-      extensionConnection.ws.close();
-      extensionConnection = null;
-      updateExtensionStatus(ConnectionState.DISCONNECTED);
-    }
+// Endpoint for client to submit an automation command
+app.post("/command", (req, res) => {
+  const { apiKey, action, url, xpath, text, x, y, timestamp } = req.body;
+  if (apiKey !== API_KEY) {
+    return res.status(403).json({ error: "Invalid API Key" });
   }
-}, HEARTBEAT_INTERVAL);
-
-/**
- * Sends an error response to a client.
- */
-function sendErrorResponse(ws, error, requestId) {
-  const errMsg = {
-    success: false,
-    error,
+  if (!action) {
+    return res.status(400).json({ error: "Missing action" });
+  }
+  const requestId = uuidv4();
+  const command = {
     requestId,
-    timestamp: new Date().toISOString(),
+    action,
+    url,
+    xpath,
+    text,
+    x,
+    y,
+    timestamp: timestamp || new Date().toISOString()
   };
-  try {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(errMsg));
-    }
-  } catch (err) {
-    logger.error("SendErrorResponse", err.message);
+  commandQueue.push(command);
+  console.info(`[${new Date().toISOString()}][Command] Queued command:`, command);
+  flushCommandQueue(); // Immediately attempt to send command if extension is connected
+  res.json({ success: true, requestId });
+});
+
+// Endpoint for client to poll for an answer based on requestId
+app.get("/command/:requestId/answer", (req, res) => {
+  const { apiKey } = req.query;
+  if (apiKey !== API_KEY) {
+    return res.status(403).json({ error: "Invalid API Key" });
   }
-}
-
-/**
- * Updates the extension status and notifies connected clients.
- */
-function updateExtensionStatus(status, errorInfo) {
-  extensionStatus = {
-    state: status,
-    lastError: errorInfo,
-    lastUpdated: Date.now(),
-  };
-  // Optionally notify clients.
-  for (const clientWs of clientConnections.values()) {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      try {
-        clientWs.send(
-          JSON.stringify({
-            type: "extension_status",
-            status: extensionStatus,
-            timestamp: new Date().toISOString(),
-          })
-        );
-      } catch (err) {
-        logger.error("UpdateExtensionStatus", err.message);
-      }
-    }
+  const requestId = req.params.requestId;
+  if (answers[requestId]) {
+    return res.json({ success: true, answer: answers[requestId].result });
   }
-}
+  res.json({ success: false, message: "Answer not ready" });
+});
 
-/**
- * Flush queued automation commands to the extension.
- */
-function flushAutomationCommandQueue() {
-  if (extensionConnection && extensionConnection.ws.readyState === WebSocket.OPEN) {
-    while (commandQueue.length > 0) {
-      const queuedCommand = commandQueue.shift();
-      try {
-        extensionConnection.ws.send(JSON.stringify(queuedCommand));
-        logger.info("Relay", { message: "Flushed queued command", command: queuedCommand });
-      } catch (err) {
-        logger.error("FlushQueue", err.message);
-        // If sending fails, push it back for retries.
-        commandQueue.unshift(queuedCommand);
-        break;
-      }
-    }
-  }
-}
+// Create HTTP server from Express application
+const server = http.createServer(app);
 
-/**
- * Handles incoming messages from any connection.
- */
-function handleMessage(ws, messageStr) {
-  let message;
-  try {
-    message = JSON.parse(messageStr);
-  } catch (err) {
-    logger.error("MessageHandler", "Invalid JSON received");
-    ws.send(
-      JSON.stringify({
-        success: false,
-        error: "Invalid JSON format",
-        timestamp: new Date().toISOString(),
-      })
-    );
-    return;
-  }
-
-  // Process extension registration.
-  if (message.type === "REGISTER_EXTENSION") {
-    if (message.apiKey !== API_KEY) {
-      updateExtensionStatus(ConnectionState.ERROR, "Invalid API key");
-      ws.close();
-      return;
-    }
-    if (extensionConnection) {
-      updateExtensionStatus(ConnectionState.DISCONNECTING);
-      extensionConnection.ws.close();
-    }
-    extensionConnection = { ws, lastHeartbeat: Date.now() };
-    updateExtensionStatus(ConnectionState.CONNECTED);
-    ws.send(
-      JSON.stringify({
-        type: "registration",
-        success: true,
-        timestamp: new Date().toISOString(),
-      })
-    );
-    // Flush any queued automation commands
-    flushAutomationCommandQueue();
-    return;
-  }
-
-  // For non-registration messages, verify API key.
-  if (message.apiKey !== API_KEY) {
-    sendErrorResponse(ws, "Unauthorized access attempt", message.requestId);
-    ws.close();
-    return;
-  }
-
-  // Process an automation-response from the extension.
-  if (message.type === "automation-response") {
-    if (message.payload && message.payload.requestId) {
-      storedResults.set(message.payload.requestId, {
-        result: message,
-        timestamp: Date.now(),
-      });
-      const clientWs = clientConnections.get(message.payload.requestId);
-      if (clientWs && clientWs.readyState === WebSocket.OPEN) {
-        try {
-          clientWs.send(JSON.stringify(message));
-        } catch (err) {
-          logger.error("Relay", err.message);
-        }
-        clientConnections.delete(message.payload.requestId);
-      }
-    }
-    return;
-  }
-
-  // Process a query for a stored result.
-  if (message.type === "query-response") {
-    const resultEntry = storedResults.get(message.requestId);
-    if (resultEntry) {
-      ws.send(JSON.stringify(resultEntry.result));
-    } else {
-      ws.send(
-        JSON.stringify({
-          success: false,
-          error: "No stored result found for this requestId",
-          requestId: message.requestId,
-          timestamp: new Date().toISOString(),
-        })
-      );
-    }
-    return;
-  }
-
-  // Process an automation-command from a client.
-  if (message.type === "automation-command") {
-    if (message.requestId) {
-      clientConnections.set(message.requestId, ws);
-    }
-    if (!extensionConnection || extensionConnection.ws.readyState !== WebSocket.OPEN) {
-      // Instead of rejecting outright, queue the command.
-      logger.info("Relay", "Extension not connected. Queuing command for later delivery.");
-      commandQueue.push(message);
-      return;
-    }
-    logger.info("Relay", { command: message });
-    try {
-      extensionConnection.ws.send(JSON.stringify(message));
-    } catch (err) {
-      logger.error("Relay Send", err.message);
-      sendErrorResponse(ws, err.message, message.requestId);
-    }
-    return;
-  }
-
-  // Unknown message type.
-  ws.send(
-    JSON.stringify({
-      success: false,
-      error: "Unknown message type",
-      timestamp: new Date().toISOString(),
-    })
-  );
-}
-
-const wss = new WebSocketServer({ port: PORT });
-logger.info("Server", `WebSocket server listening on port ${PORT}`);
+// --- WEBSOCKET SETUP for the Chrome Extension
+// The extension must connect to ws://localhost:8765/ws.
+const wss = new WebSocketServer({ server, path: "/ws" });
+let extensionConnection = null; // Registered extension's WebSocket
 
 wss.on("connection", (ws, req) => {
-  const clientId = Math.random().toString(36).substring(2, 7);
-  const ip = req.socket.remoteAddress;
-  logger.info("Connection", { clientId, ip, headers: req.headers });
-
-  ws.on("ping", () => ws.pong());
-  ws.on("pong", () => {
-    if (extensionConnection && extensionConnection.ws === ws) {
-      extensionConnection.lastHeartbeat = Date.now();
-    }
-  });
-
+  console.info(`[${new Date().toISOString()}][WS Connection] New connection from ${req.socket.remoteAddress}`);
+  
   ws.on("message", (data) => {
-    const messageStr = data.toString();
-    logger.info("Received", { clientId, message: messageStr });
-    handleMessage(ws, messageStr);
-  });
-
-  ws.on("close", () => {
-    if (extensionConnection && extensionConnection.ws === ws) {
-      extensionConnection = null;
-      updateExtensionStatus(ConnectionState.DISCONNECTED);
-      for (const clientWs of clientConnections.values()) {
-        if (clientWs.readyState === WebSocket.OPEN) {
-          clientWs.send(
-            JSON.stringify({
-              type: "extension_status",
-              status: "disconnected",
-              timestamp: new Date().toISOString(),
-            })
-          );
-        }
-      }
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch (err) {
+      console.error("Invalid JSON received via WS");
+      return;
     }
-    logger.info("Disconnection", { clientId, ip });
+    // Handle extension registration
+    if (message.type === "REGISTER_EXTENSION") {
+      if (message.apiKey !== API_KEY) {
+        ws.send(JSON.stringify({ type: "registration", success: false, error: "Invalid API Key" }));
+        ws.close();
+        return;
+      }
+      if (extensionConnection) {
+        console.info("Existing extension connection found, closing it.");
+        extensionConnection.close();
+      }
+      extensionConnection = ws;
+      ws.send(JSON.stringify({ type: "registration", success: true, timestamp: new Date().toISOString() }));
+      console.info(`[${new Date().toISOString()}][WS] Extension registered.`);
+      flushCommandQueue();
+      return;
+    }
+    // Handle automation response from the extension
+    if (message.type === "automation-response") {
+      const payload = message.payload;
+      if (payload && payload.requestId) {
+        answers[payload.requestId] = { result: payload, timestamp: Date.now() };
+        console.info(`[${new Date().toISOString()}][WS] Received answer for requestId: ${payload.requestId}`);
+      }
+      return;
+    }
   });
-
-  ws.on("error", (err) => {
-    logger.error("WebSocketError", { clientId, error: err.message });
-    if (extensionConnection && extensionConnection.ws === ws) {
-      updateExtensionStatus(ConnectionState.ERROR, err.message);
+  
+  ws.on("close", () => {
+    if (ws === extensionConnection) {
+      console.info(`[${new Date().toISOString()}][WS] Extension disconnected.`);
+      extensionConnection = null;
     }
   });
 });
 
-setInterval(() => {
-  if (extensionConnection && extensionConnection.ws.readyState === WebSocket.OPEN) {
+// Helper to flush queued commands to the extension if connected
+function flushCommandQueue() {
+  if (!extensionConnection || extensionConnection.readyState !== extensionConnection.OPEN) {
+    console.info("Extension not connected – cannot flush queue.");
+    return;
+  }
+  while (commandQueue.length > 0) {
+    const cmd = commandQueue.shift();
     try {
-      extensionConnection.ws.ping();
+      extensionConnection.send(JSON.stringify(cmd));
+      console.info(`[${new Date().toISOString()}][WS Relay] Sent command:`, cmd);
     } catch (err) {
-      updateExtensionStatus(ConnectionState.ERROR, err.message);
+      console.error("Failed to send queued command:", err.message);
+      commandQueue.unshift(cmd);
+      break;
     }
   }
-}, HEARTBEAT_INTERVAL);
+}
+
+// Start the combined HTTP & WS server
+server.listen(PORT, () => {
+  console.log(`REST API and WebSocket server listening on port ${PORT}`);
+});
