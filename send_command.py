@@ -6,7 +6,8 @@
 #     "argparse",
 #     "websockets",
 #     "asyncio",
-#     "uuid"
+#     "uuid",
+#     "logging"
 # ]
 # ///
 
@@ -29,11 +30,23 @@ import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
 import uuid
 import websockets
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('send_command.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 def generate_request_id() -> str:
     # Generate a unique request ID using uuid4.
@@ -91,6 +104,8 @@ def handle_response(response: dict) -> None:
 
 async def send_message(ws, message: dict) -> None:
     """Send a JSON message over the WebSocket."""
+    logger.info("📤 Sending message")
+    logger.debug(f"Message details: {json.dumps(message, indent=2)}")
     await ws.send(json.dumps(message))
 
 async def wait_for_automation_response(ws) -> dict:
@@ -99,25 +114,35 @@ async def wait_for_automation_response(ws) -> dict:
     Other messages (such as extension_status) are logged and ignored.
     """
     while True:
-        raw = await ws.recv()
         try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            print("Error: Received invalid JSON", raw)
-            continue
-        msg_type = msg.get("type")
-        if msg_type == "automation-response":
-            print("Received automation-response with requestId:",
-                  msg.get("payload", {}).get("requestId"))
-            return msg
-        # If no explicit type but the payload looks like an automation response, use it.
-        if msg_type is None and "payload" in msg and msg.get("payload", {}).get("action"):
-            print("Received automation-like payload.")
-            return msg
-        # Log ignored messages.
-        print("Ignoring message of type:", msg.get("type"))
+            raw = await ws.recv()
+            logger.info(f"📥 Raw response received")
+            logger.debug(f"Response content: {raw}")
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.error("❌ Failed to parse response JSON")
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "automation-response":
+                logger.info("🎉 Valid response received!")
+                logger.debug(f"Response payload: {json.dumps(msg, indent=2)}")
+                return msg
+            # If no explicit type but the payload looks like an automation response, use it.
+            if msg_type is None and "payload" in msg and msg.get("payload", {}).get("action"):
+                logger.info("🎉 Valid response received!")
+                logger.debug(f"Response payload: {json.dumps(msg, indent=2)}")
+                return msg
+            # Log ignored messages.
+            logger.warning(f"⚠️ Ignoring message of type: {msg.get('type')}")
+        except asyncio.TimeoutError:
+            logger.error("⏰ No response received within 30 seconds")
+            return None
+        except Exception as recv_error:
+            logger.error(f"❗ Error receiving response: {recv_error}")
+            return None
 
-async def automation_command(command: dict, timeout: int = 120) -> None:
+async def automation_command(command: dict, timeout: int = 5) -> None:
     """
     Open a WebSocket connection, send the automation command, and await an automation-response.
     If connection closes too early, automatically fall back to a query.
@@ -125,12 +150,14 @@ async def automation_command(command: dict, timeout: int = 120) -> None:
     api_key = command["apiKey"]
     request_id = command["requestId"]
     try:
+        logger.info("🔌 Attempting connection to WebSocket server")
         async with websockets.connect("ws://localhost:8765") as ws:
+            logger.info("✅ Connected to WebSocket server")
             await send_message(ws, command)
             response = await asyncio.wait_for(wait_for_automation_response(ws), timeout=timeout)
             handle_response(response)
     except (websockets.ConnectionClosed, asyncio.IncompleteReadError):
-        print("Connection closed before a response was received. Querying stored result...")
+        logger.error("❌ Connection closed before a response was received. Querying stored result...")
         await query_response({
             "type": "query-response",
             "apiKey": api_key,
@@ -138,10 +165,10 @@ async def automation_command(command: dict, timeout: int = 120) -> None:
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         })
     except asyncio.TimeoutError:
-        print(f"Error: Timed out after {timeout} seconds waiting for a response.", file=sys.stderr)
+        logger.error(f"⏰ Timed out after {timeout} seconds waiting for a response.")
         sys.exit(1)
     except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:
-        print(f"Error: Could not connect to the server: {e}", file=sys.stderr)
+        logger.error(f"❗ Error: Could not connect to the server: {e}")
         sys.exit(1)
 
 async def query_response(query: dict, timeout: int = 30) -> None:
@@ -150,15 +177,17 @@ async def query_response(query: dict, timeout: int = 30) -> None:
     and wait for the stored result.
     """
     try:
+        logger.info("🔌 Attempting connection to WebSocket server")
         async with websockets.connect("ws://localhost:8765") as ws:
+            logger.info("✅ Connected to WebSocket server")
             await send_message(ws, query)
             response = await asyncio.wait_for(wait_for_automation_response(ws), timeout=timeout)
             handle_response(response)
     except asyncio.TimeoutError:
-        print(f"Error: Timed out after {timeout} seconds waiting for query response.", file=sys.stderr)
+        logger.error(f"⏰ Timed out after {timeout} seconds waiting for query response.")
         sys.exit(1)
     except (websockets.exceptions.WebSocketException, ConnectionRefusedError) as e:
-        print(f"Error: Could not connect to the server: {e}", file=sys.stderr)
+        logger.error(f"❗ Error: Could not connect to the server: {e}")
         sys.exit(1)
 
 def main():
@@ -179,7 +208,7 @@ def main():
     args = parser.parse_args()
     api_key = os.environ.get("API_KEY")
     if not api_key:
-        print("Error: API_KEY environment variable must be set.", file=sys.stderr)
+        logger.error("Error: API_KEY environment variable must be set.")
         sys.exit(1)
     
     if args.query:
@@ -189,7 +218,7 @@ def main():
             "requestId": args.query,
             "timestamp": args.timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
-        print("Sending query for request-id:", args.query)
+        logger.info("Sending query for request-id: %s", args.query)
         asyncio.run(query_response(query_msg))
     else:
         request_id = generate_request_id()
@@ -211,9 +240,9 @@ def main():
         if args.url:
             command["url"] = args.url
 
-        print("Sending automation command:")
-        print(json.dumps(command, indent=2))
-        print(f"Generated Request ID: {request_id}")
+        logger.info("Sending automation command:")
+        logger.debug(json.dumps(command, indent=2))
+        logger.info("Generated Request ID: %s", request_id)
         asyncio.run(automation_command(command))
 
 if __name__ == "__main__":
